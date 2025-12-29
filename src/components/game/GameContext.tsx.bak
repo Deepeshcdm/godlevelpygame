@@ -1,0 +1,3447 @@
+import React, { createContext, useContext, useState, useEffect, useCallback, useRef } from 'react';
+import { toast } from '@/hooks/use-toast';
+import { PythonQuiz, getRandomQuizForTopic, pythonQuizBank } from '../../data/pythonQuizzes'; // Import pythonQuizBank
+
+// API Key for Gemini AI
+const GEMINI_API_KEY = 'AIzaSyAo_edLyN42xYWoshKJFR8WH06nj_pXLAE';
+
+// Define game types
+export type Position = {
+  x: number;
+  y: number;
+};
+
+export type Terrain = 'grass' | 'water' | 'stone' | 'path' | 'wall' | 'tree' | 'bridge';
+
+export type Tile = {
+  terrain: Terrain;
+  walkable: boolean;
+};
+
+export type NPC = {
+  id: string;
+  name: string;
+  position: Position;
+  dialogue: string[];
+  quest?: Quest;
+  sprite: string;
+  personality?: string; // For AI context
+  // Enhanced Quiz properties
+  conceptTitle: string;
+  conceptExplanation: string;
+  demoCodeSnippet: string;
+  quizTopic: keyof typeof pythonQuizBank; // The topic for this NPC's quizzes
+  hasPassedQuiz: boolean;
+};
+
+export type QuestObjective = {
+  id: string;
+  description: string;
+  type: 'collect' | 'location' | 'interact';
+  targetId?: string; // ID of item to collect or NPC to interact with
+  targetPosition?: Position; // Position to reach for location objectives
+  count?: number; // Number of items to collect
+  completed: boolean;
+  currentProgress?: number; // For collection objectives
+};
+
+export type Quest = {
+  id: string;
+  title: string;
+  description: string;
+  objectives: QuestObjective[];
+  relatedQuestItemIds: string[]; // IDs of quest items linked to this quest
+  active: boolean; // Whether the quest is currently active
+  completed: boolean;
+  npcId: string; // The NPC who gave the quest
+  reward?: Item;
+  xpReward: number; // Experience points awarded for completing the quest
+};
+
+export type Item = {
+  id: string;
+  name: string;
+  description: string;
+  type: 'weapon' | 'potion' | 'key' | 'artifact';
+  value: number;
+  sprite: string;
+  position?: Position; // Make position optional in the base Item type
+};
+
+// Define quest item as an item with a position
+export type QuestItem = Item & {
+  position: Position; // Position is required for quest items
+};
+
+// Define SpeechRecognition interfaces
+interface SpeechRecognition extends EventTarget {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  onstart: (event: Event) => void;
+  onresult: (event: SpeechRecognitionEvent) => void;
+  onerror: (event: SpeechRecognitionErrorEvent) => void;
+  onend: (event: Event) => void;
+  start: () => void;
+  stop: () => void;
+}
+
+interface SpeechRecognitionEvent {
+  results: SpeechRecognitionResultList;
+}
+
+interface SpeechRecognitionResultList {
+  readonly length: number;
+  [index: number]: SpeechRecognitionResult;
+}
+
+interface SpeechRecognitionResult {
+  readonly length: number;
+  [index: number]: SpeechRecognitionAlternative;
+}
+
+interface SpeechRecognitionAlternative {
+  transcript: string;
+  confidence: number;
+}
+
+interface SpeechRecognitionErrorEvent extends Event {
+  error: string;
+  message: string;
+}
+
+// Declare global types
+declare global {
+  interface Window {
+    SpeechRecognition: {
+      new(): SpeechRecognition;
+    };
+    webkitSpeechRecognition: {
+      new(): SpeechRecognition;
+    };
+    currentRecognition: SpeechRecognition;
+  }
+}
+
+type GameState = {
+  player: {
+    position: Position;
+    targetPosition: Position;
+    visualPosition: Position; // Added for smooth animation
+    isMoving: boolean;
+    direction: 'up' | 'down' | 'left' | 'right';
+    sprite: string;
+    level: number; // Player's current level
+    xp: number; // Current XP amount
+    nextLevelXp: number; // XP required for next level
+  };
+  gameMap: Tile[][];
+  npcs: NPC[];
+  inventory: Item[];
+  activeQuests: Quest[];
+  completedQuests: Quest[];
+  questItems: QuestItem[]; // Only visible quest items
+  hiddenQuestItems: QuestItem[]; // Quest items that aren't visible yet
+  activeDialogue: {
+    npc: NPC | null;
+    active: boolean;
+    currentResponseIndex: number;
+  };
+  uiState: {
+    inventoryOpen: boolean;
+    questLogOpen: boolean;
+    showLevelUp: boolean; // Whether to show level up notification
+    showTutorial: boolean; // Whether to show tutorial for first-time players
+  };
+  currentConversationHistory: string[];
+  // Quiz state
+  activeQuiz: {
+    npcId: string | null;
+    active: boolean;
+    playerAnswer: string;
+    currentQuiz: PythonQuiz | null; // Store the current random quiz
+  };
+  // New state to trigger interaction after quiz
+  npcToInteractAfterQuiz: string | null; 
+};
+
+// Initial game state
+const initialState: GameState = {
+  player: {
+    position: { x: 25, y: 25 },
+    targetPosition: { x: 25, y: 25 },
+    visualPosition: { x: 25, y: 25 }, // Initialize visual position same as actual position
+    isMoving: false,
+    direction: 'down',
+    sprite: 'player_down',
+    level: 1,
+    xp: 0,
+    nextLevelXp: 100
+  },
+  gameMap: [], // Will be initialized in useEffect
+  npcs: [
+    {
+      id: 'npc1',
+      name: 'Elder Mystic',
+      position: { x: 22, y: 18 },
+      dialogue: [
+        "Welcome to Mystic Realms, young adventurer...",
+        "Our world is in danger...",
+        "Speak with the villagers..."
+      ],
+      quest: {
+        id: 'quest1',
+        title: 'The Fading Crystals',
+        description: 'Find the sacred crystals to restore balance to the realm.',
+        completed: false,
+        active: false,
+        objectives: [],
+        relatedQuestItemIds: [],
+        npcId: 'npc1',
+        xpReward: 100
+      },
+      sprite: 'elder',
+      personality: 'A wise, ancient guardian...',
+      // Quiz Data for NPC 1: Variables & print()
+      conceptTitle: "Variables & print()",
+      conceptExplanation: "Variables store data. `print()` displays output.",
+      demoCodeSnippet: 
+`message = "Hello, adventurer!"
+print(message)`,
+      quizTopic: 'variables', // Map to quiz topic
+      hasPassedQuiz: false
+    },
+    {
+      id: 'npc2',
+      name: 'Merchant Ryla',
+      position: { x: 28, y: 22 },
+      dialogue: [
+        "Greetings! I'm Ryla...",
+        "I trade in rare artifacts...",
+        "Complete quests..."
+      ],
+      quest: {
+        id: 'quest4',
+        title: 'The Lost Map Piece',
+        description: 'Find the missing piece of the ancient map for Merchant Ryla.',
+        completed: false,
+        active: false,
+        objectives: [
+          {
+            id: 'q4_obj1',
+            description: 'Find the missing map piece',
+            type: 'collect',
+            targetId: 'questItem5', // Example item ID
+            completed: false,
+            currentProgress: 0,
+            count: 1
+          },
+          {
+            id: 'q4_obj2',
+            description: 'Return to Merchant Ryla',
+            type: 'interact',
+            targetId: 'npc2',
+            completed: false
+          }
+        ],
+        relatedQuestItemIds: ['questItem5'],
+        npcId: 'npc2',
+        xpReward: 150
+      },
+      sprite: 'merchant',
+      personality: 'A cheerful, business-savvy merchant...',
+      // Quiz Data for NPC 2: If Statements
+      conceptTitle: "If Statements",
+      conceptExplanation: "`if` statements run code only if a condition is true.",
+      demoCodeSnippet:
+`gold = 150
+if gold > 100:
+  print("You have enough gold!")`,
+      quizTopic: 'if_statements', // Map to quiz topic
+      hasPassedQuiz: false
+    },
+    {
+      id: 'npc3',
+      name: 'Ranger Thorne',
+      position: { x: 35, y: 30 },
+      dialogue: [
+        "Keep your wits about you...",
+        "There have been strange creatures...",
+        "I can teach you tracking skills..."
+      ],
+      sprite: 'elder',
+      quest: {
+        id: 'quest2',
+        title: 'Strange Disturbances',
+        description: 'Investigate the unusual activity near the eastern ruins with Ranger Thorne.',
+        completed: false,
+        active: false,
+        objectives: [],
+        relatedQuestItemIds: [],
+        npcId: 'npc3',
+        xpReward: 120
+      },
+      personality: 'A gruff, no-nonsense forest ranger...',
+      // Quiz Data for NPC 3: Loops
+      conceptTitle: "Loops (for)",
+      conceptExplanation: "`for` loops repeat actions for each item in a sequence.",
+      demoCodeSnippet:
+`for item in ["sword", "shield"]:
+  print("Found:", item)`,
+      quizTopic: 'loops', // Map to quiz topic
+      hasPassedQuiz: false
+    },
+    {
+      id: 'npc4',
+      name: 'Alchemist Vex',
+      position: { x: 15, y: 40 },
+      dialogue: [
+        "Ah! A visitor! Perfect timing!...",
+        "I'm working on a revolutionary potion...",
+        "Bring me some firebloom petals..."
+      ],
+      sprite: 'merchant',
+      quest: {
+        id: 'quest3',
+        title: 'Alchemical Wonders',
+        description: 'Collect firebloom petals for Alchemist Vex.',
+        completed: false,
+        active: false,
+        objectives: [],
+        relatedQuestItemIds: [],
+        npcId: 'npc4',
+        xpReward: 130
+      },
+      personality: 'An eccentric, enthusiastic alchemist...',
+      // Quiz Data for NPC 4: Functions
+      conceptTitle: "Functions (def)",
+      conceptExplanation: "Functions group code to perform a specific task.",
+      demoCodeSnippet:
+`def greet(name):
+  print("Hello,", name)
+greet("Hero")`,
+      quizTopic: 'functions', // Map to quiz topic
+      hasPassedQuiz: false
+    }
+  ],
+  inventory: [
+    {
+      id: 'item1',
+      name: 'Healing Potion',
+      description: 'Restores health when consumed.',
+      type: 'potion',
+      value: 10,
+      sprite: 'healing_potion'
+    }
+  ],
+  activeQuests: [],
+  completedQuests: [],
+  questItems: [], // Start with no visible quest items
+  hiddenQuestItems: [
+    // Quest1 items - Elder Mystic's crystals
+    {
+      id: 'questItem1',
+      name: 'Fading Crystal',
+      description: 'A mystical crystal pulsing with faint energy. It needs to be returned to the Elder Mystic.',
+      type: 'artifact',
+      value: 50,
+      sprite: 'crystal_blue',
+      position: { x: 30, y: 20 }
+    },
+    {
+      id: 'questItem2',
+      name: 'Ancient Crystal',
+      description: 'An ancient crystal with mysterious powers. The Elder Mystic needs this.',
+      type: 'artifact',
+      value: 50,
+      sprite: 'crystal_green',
+      position: { x: 40, y: 35 }
+    },
+    // Quest3 items - Alchemist Vex's firebloom petals
+    {
+      id: 'questItem3_1',
+      name: 'Firebloom Petal',
+      description: 'A vibrant red petal that radiates heat. Alchemist Vex would be interested in this.',
+      type: 'artifact',
+      value: 30,
+      sprite: 'petals',
+      position: { x: 20, y: 45 }
+    },
+    {
+      id: 'questItem3_2',
+      name: 'Firebloom Petal',
+      description: 'A vibrant red petal that radiates heat. Alchemist Vex would be interested in this.',
+      type: 'artifact',
+      value: 30,
+      sprite: 'petals',
+      position: { x: 15, y: 33 }
+    },
+    {
+      id: 'questItem3_3',
+      name: 'Firebloom Petal',
+      description: 'A vibrant red petal that radiates heat. Alchemist Vex would be interested in this.',
+      type: 'artifact',
+      value: 30,
+      sprite: 'petals',
+      position: { x: 33, y: 15 }
+    },
+    // Quest2 items - Ranger Thorne's footprints
+    {
+      id: 'questItem4',
+      name: 'Strange Footprints',
+      description: 'Unusual tracks from an unknown creature. Ranger Thorne should examine these.',
+      type: 'artifact',
+      value: 0,
+      sprite: 'tracks',
+      position: { x: 38, y: 32 }
+    },
+    // Quest4 item - Merchant Ryla's map piece
+    {
+      id: 'questItem5',
+      name: 'Missing Map Piece',
+      description: 'A crucial piece of the ancient map. Merchant Ryla needs this.',
+      type: 'artifact',
+      value: 40,
+      sprite: 'map_piece',
+      position: { x: 22, y: 35 }
+    }
+  ],
+  activeDialogue: {
+    npc: null,
+    active: false,
+    currentResponseIndex: 0
+  },
+  uiState: {
+    inventoryOpen: false,
+    questLogOpen: false,
+    showLevelUp: false,
+    showTutorial: true // Show tutorial for first-time players by default
+  },
+  currentConversationHistory: [],
+  activeQuiz: {
+    npcId: null,
+    active: false,
+    playerAnswer: '',
+    currentQuiz: null
+  },
+  npcToInteractAfterQuiz: null // Initialize as null
+};
+
+// Generate a larger game map
+const generateGameMap = (width: number, height: number): { map: Tile[][], playerSpawnPosition: Position, npcPositions: { [key: string]: Position } } => {
+  const map: Tile[][] = [];
+  
+  // Initialize map with grass
+  for (let y = 0; y < height; y++) {
+    const row: Tile[] = [];
+    for (let x = 0; x < width; x++) {
+      // Create border walls
+      if (x === 0 || y === 0 || x === width - 1 || y === height - 1) {
+        row.push({ terrain: 'wall', walkable: false });
+      } else {
+        row.push({ terrain: 'grass', walkable: true });
+      }
+    }
+    map.push(row);
+  }
+
+  // Generate rivers
+  const generateRiver = (startX: number, startY: number, length: number, direction: 'horizontal' | 'vertical') => {
+    let x = startX;
+    let y = startY;
+    
+    // Keep track of river tiles to ensure we don't create completely impassable rivers
+    const riverTiles: Position[] = [];
+    
+    for (let i = 0; i < length; i++) {
+      if (x >= 0 && x < width && y >= 0 && y < height) {
+        map[y][x] = { terrain: 'water', walkable: false };
+        riverTiles.push({ x, y });
+        
+        // Add some width to the river
+        if (direction === 'horizontal') {
+          if (y > 0) map[y-1][x] = { terrain: 'water', walkable: false };
+          if (y < height-1) map[y+1][x] = { terrain: 'water', walkable: false };
+        } else {
+          if (x > 0) map[y][x-1] = { terrain: 'water', walkable: false };
+          if (x < width-1) map[y][x+1] = { terrain: 'water', walkable: false };
+        }
+      }
+      
+      // Move in the river's direction with some randomness
+      if (direction === 'horizontal') {
+        x += Math.random() < 0.8 ? 1 : -1;
+        y += Math.random() < 0.3 ? (Math.random() < 0.5 ? 1 : -1) : 0;
+      } else {
+        y += Math.random() < 0.8 ? 1 : -1;
+        x += Math.random() < 0.3 ? (Math.random() < 0.5 ? 1 : -1) : 0;
+      }
+    }
+    
+    // Add a bridge at a random point along the river to ensure connectivity
+    if (riverTiles.length > 0) {
+      const bridgeIndex = Math.floor(Math.random() * riverTiles.length);
+      const bridgePos = riverTiles[bridgeIndex];
+      map[bridgePos.y][bridgePos.x] = { terrain: 'bridge', walkable: true };
+    }
+  };
+
+  // Generate multiple rivers
+  const numRivers = Math.floor(Math.random() * 3) + 2; // 2-4 rivers
+  for (let i = 0; i < numRivers; i++) {
+    const startX = Math.floor(Math.random() * (width - 10)) + 5;
+    const startY = Math.floor(Math.random() * (height - 10)) + 5;
+    const length = Math.floor(Math.random() * 20) + 15;
+    const direction = Math.random() < 0.5 ? 'horizontal' : 'vertical';
+    generateRiver(startX, startY, length, direction);
+  }
+
+  // Add bridges near rivers
+  for (let y = 1; y < height - 1; y++) {
+    for (let x = 1; x < width - 1; x++) {
+      if (map[y][x].terrain === 'water') {
+        // Check for potential bridge locations
+        if (map[y-1][x].terrain === 'grass' && map[y+1][x].terrain === 'grass' && Math.random() < 0.3) {
+          map[y][x] = { terrain: 'bridge', walkable: true };
+        }
+        if (map[y][x-1].terrain === 'grass' && map[y][x+1].terrain === 'grass' && Math.random() < 0.3) {
+          map[y][x] = { terrain: 'bridge', walkable: true };
+        }
+      }
+    }
+  }
+
+  // Ensure map connectivity by adding bridges at strategic locations
+  const ensureMapConnectivity = () => {
+    // Find all water tiles that separate grass areas
+    const potentialBridgeLocations: Position[] = [];
+    
+    for (let y = 1; y < height - 1; y++) {
+      for (let x = 1; x < width - 1; x++) {
+        if (map[y][x].terrain === 'water') {
+          // Check if this water tile separates two grass areas
+          const hasGrassOnBothSides = 
+            (map[y-1][x].terrain === 'grass' && map[y+1][x].terrain === 'grass') ||
+            (map[y][x-1].terrain === 'grass' && map[y][x+1].terrain === 'grass');
+            
+          if (hasGrassOnBothSides) {
+            potentialBridgeLocations.push({ x, y });
+          }
+        }
+      }
+    }
+    
+    // Sort bridge locations by distance from center (prioritize bridges near the center)
+    const centerX = Math.floor(width / 2);
+    const centerY = Math.floor(height / 2);
+    
+    potentialBridgeLocations.sort((a, b) => {
+      const distA = Math.sqrt(Math.pow(a.x - centerX, 2) + Math.pow(a.y - centerY, 2));
+      const distB = Math.sqrt(Math.pow(b.x - centerX, 2) + Math.pow(b.y - centerY, 2));
+      return distA - distB;
+    });
+    
+    // Add bridges at strategic locations to ensure connectivity
+    // We'll add at least 3 bridges to ensure the map is connected
+    const numBridgesToAdd = Math.max(3, Math.floor(potentialBridgeLocations.length * 0.2));
+    
+    for (let i = 0; i < numBridgesToAdd && i < potentialBridgeLocations.length; i++) {
+      const pos = potentialBridgeLocations[i];
+      map[pos.y][pos.x] = { terrain: 'bridge', walkable: true };
+    }
+  };
+  
+  // Call the function to ensure map connectivity
+  ensureMapConnectivity();
+
+  // Add trees with some clustering
+  for (let y = 1; y < height - 1; y++) {
+    for (let x = 1; x < width - 1; x++) {
+      if (map[y][x].terrain === 'grass' && Math.random() < 0.1) {
+        // Create a small cluster of trees
+        const clusterSize = Math.floor(Math.random() * 3) + 1;
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+            if (Math.random() < 0.5 && 
+                x + dx > 0 && x + dx < width - 1 && 
+                y + dy > 0 && y + dy < height - 1) {
+              if (map[y + dy][x + dx].terrain === 'grass') {
+                map[y + dy][x + dx] = { terrain: 'tree', walkable: false };
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Add paths connecting different areas
+  const generatePath = (startX: number, startY: number, endX: number, endY: number) => {
+    let x = startX;
+    let y = startY;
+    
+    while (x !== endX || y !== endY) {
+      if (map[y][x].terrain === 'grass') {
+        map[y][x] = { terrain: 'path', walkable: true };
+      }
+      
+      if (Math.random() < 0.5) {
+        x += x < endX ? 1 : -1;
+      } else {
+        y += y < endY ? 1 : -1;
+      }
+    }
+  };
+
+  // Generate some random paths
+  const numPaths = Math.floor(Math.random() * 3) + 2;
+  for (let i = 0; i < numPaths; i++) {
+    const startX = Math.floor(Math.random() * (width - 2)) + 1;
+    const startY = Math.floor(Math.random() * (height - 2)) + 1;
+    const endX = Math.floor(Math.random() * (width - 2)) + 1;
+    const endY = Math.floor(Math.random() * (height - 2)) + 1;
+    generatePath(startX, startY, endX, endY);
+  }
+
+  // Function to check if a position is a valid spawn location
+  const isValidSpawnLocation = (x: number, y: number): boolean => {
+    // Check if the position itself is walkable
+    if (!map[y][x].walkable) return false;
+    
+    // Check if at least one adjacent tile is walkable
+    const adjacentPositions = [
+      { x: x, y: y - 1 }, // up
+      { x: x, y: y + 1 }, // down
+      { x: x - 1, y: y }, // left
+      { x: x + 1, y: y }  // right
+    ];
+    
+    // Count walkable adjacent tiles
+    const walkableAdjacentCount = adjacentPositions.filter(pos => {
+      // Check if the position is within bounds
+      if (pos.x < 0 || pos.x >= width || pos.y < 0 || pos.y >= height) {
+        return false;
+      }
+      return map[pos.y][pos.x].walkable;
+    }).length;
+    
+    // Return true if at least one adjacent tile is walkable
+    return walkableAdjacentCount > 0;
+  };
+
+  // Find a valid spawn location for the player
+  const findValidSpawnLocation = (): Position => {
+    // Try the default position first
+    const defaultX = 25;
+    const defaultY = 25;
+    
+    if (isValidSpawnLocation(defaultX, defaultY)) {
+      return { x: defaultX, y: defaultY };
+    }
+    
+    // If default position is not valid, try random positions
+    let attempts = 0;
+    const maxAttempts = 100; // Prevent infinite loops
+    
+    while (attempts < maxAttempts) {
+      const x = Math.floor(Math.random() * (width - 2)) + 1;
+      const y = Math.floor(Math.random() * (height - 2)) + 1;
+      
+      if (isValidSpawnLocation(x, y)) {
+        return { x, y };
+      }
+      
+      attempts++;
+    }
+    
+    // If we couldn't find a valid position after many attempts,
+    // create one by ensuring the default position and its surroundings are walkable
+    map[defaultY][defaultX] = { terrain: 'path', walkable: true };
+    map[defaultY-1][defaultX] = { terrain: 'path', walkable: true };
+    
+    return { x: defaultX, y: defaultY };
+  };
+
+  // Find a valid spawn location for the player
+  const playerSpawnPosition = findValidSpawnLocation();
+  
+  // Ensure the player starting position is walkable
+  map[playerSpawnPosition.y][playerSpawnPosition.x] = { terrain: 'path', walkable: true };
+  
+  // Find valid spawn locations for NPCs
+  const npcPositions: { [key: string]: Position } = {};
+  
+  // Function to find a valid spawn location for an NPC
+  const findValidNPCLocation = (excludePositions: Position[]): Position => {
+    let attempts = 0;
+    const maxAttempts = 100; // Prevent infinite loops
+    
+    while (attempts < maxAttempts) {
+      const x = Math.floor(Math.random() * (width - 2)) + 1;
+      const y = Math.floor(Math.random() * (height - 2)) + 1;
+      
+      // Check if this position is already taken by another NPC or the player
+      const isPositionTaken = excludePositions.some(pos => pos.x === x && pos.y === y);
+      if (isPositionTaken) {
+        attempts++;
+        continue;
+      }
+      
+      // Check if the position itself is valid
+      if (!isValidSpawnLocation(x, y)) {
+        attempts++;
+        continue;
+      }
+      
+      // Check if the 3x3 area around the position is suitable for path tiles
+      let suitableArea = true;
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          const checkX = x + dx;
+          const checkY = y + dy;
+          
+          // Check if the position is within bounds
+          if (checkX <= 0 || checkX >= width - 1 || checkY <= 0 || checkY >= height - 1) {
+            suitableArea = false;
+            break;
+          }
+          
+          // Check if the tile is walkable or grass (can be converted to path)
+          // Don't place NPCs near important map features like rivers
+          if (map[checkY][checkX].terrain !== 'grass' && !map[checkY][checkX].walkable) {
+            suitableArea = false;
+            break;
+          }
+        }
+        
+        if (!suitableArea) break;
+      }
+      
+      if (suitableArea) {
+        // Now check if we can find a path from player spawn to this position
+        const path = findPath(map, playerSpawnPosition, { x, y });
+        if (path !== null) {
+          return { x, y };
+        }
+      }
+      
+      attempts++;
+    }
+    
+    // If we couldn't find a valid position, create one
+    const x = Math.floor(Math.random() * (width - 2)) + 1;
+    const y = Math.floor(Math.random() * (height - 2)) + 1;
+    
+    // Create a 3x3 path area
+    for (let dy = -1; dy <= 1; dy++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        const createX = x + dx;
+        const createY = y + dy;
+        
+        // Check if the position is within bounds
+        if (createX > 0 && createX < width - 1 && createY > 0 && createY < height - 1) {
+          map[createY][createX] = { terrain: 'path', walkable: true };
+        }
+      }
+    }
+    
+    // Ensure there's a path to the NPC
+    // Create a simple path from player to NPC by making tiles walkable
+    let pathX = playerSpawnPosition.x;
+    const stepX = x > pathX ? 1 : -1;
+    while (pathX !== x) {
+      pathX += stepX;
+      if (pathX >= 0 && pathX < width && playerSpawnPosition.y >= 0 && playerSpawnPosition.y < height) {
+        map[playerSpawnPosition.y][pathX] = { terrain: 'path', walkable: true };
+      }
+    }
+    
+    let pathY = playerSpawnPosition.y;
+    const stepY = y > pathY ? 1 : -1;
+    while (pathY !== y) {
+      pathY += stepY;
+      if (x >= 0 && x < width && pathY >= 0 && pathY < height) {
+        map[pathY][x] = { terrain: 'path', walkable: true };
+      }
+    }
+    
+    return { x, y };
+  };
+  
+  // Find valid positions for each NPC
+  const usedPositions: Position[] = [playerSpawnPosition];
+  
+  // Function to create a 3x3 path tile layout around an NPC
+  const createNPCPathLayout = (npcPosition: Position): void => {
+    // Create a 3x3 grid of path tiles centered on the NPC
+    for (let dy = -1; dy <= 1; dy++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        const x = npcPosition.x + dx;
+        const y = npcPosition.y + dy;
+        
+        // Check if the position is within bounds
+        if (x > 0 && x < width - 1 && y > 0 && y < height - 1) {
+          // Only place path tiles on walkable or empty tiles (grass)
+          // Don't overwrite important objects like rivers or trees
+          if (map[y][x].terrain === 'grass' || map[y][x].walkable) {
+            map[y][x] = { terrain: 'path', walkable: true };
+          }
+        }
+      }
+    }
+  };
+  
+  initialState.npcs.forEach(npc => {
+    const npcPosition = findValidNPCLocation(usedPositions);
+    npcPositions[npc.id] = npcPosition;
+    usedPositions.push(npcPosition);
+    
+    // Ensure the NPC position is walkable
+    map[npcPosition.y][npcPosition.x] = { terrain: 'path', walkable: true };
+    
+    // Create a 3x3 path tile layout around the NPC
+    createNPCPathLayout(npcPosition);
+  });
+
+  return { map, playerSpawnPosition, npcPositions };
+};
+
+// Pathfinding algorithm (A*) to check if a path exists between two positions
+const findPath = (
+  gameMap: Tile[][],
+  start: Position,
+  end: Position
+): Position[] | null => {
+  // Handle invalid input
+  if (!gameMap || !gameMap.length || !gameMap[0] || !start || !end) {
+    return null;
+  }
+  
+  // If start or end are out of bounds, return null
+  if (
+    start.x < 0 || start.x >= gameMap[0].length || start.y < 0 || start.y >= gameMap.length ||
+    end.x < 0 || end.x >= gameMap[0].length || end.y < 0 || end.y >= gameMap.length
+  ) {
+    return null;
+  }
+
+  // If start or end are not walkable, return null
+  if (!gameMap[start.y][start.x].walkable || !gameMap[end.y][end.x].walkable) {
+    return null;
+  }
+
+  // Define heuristic function (Manhattan distance)
+  const heuristic = (pos: Position): number => {
+    return Math.abs(pos.x - end.x) + Math.abs(pos.y - end.y);
+  };
+
+  // Define the set of nodes to evaluate
+  const openSet: Position[] = [start];
+  
+  // Map to track where each position came from
+  const cameFrom: Map<string, Position> = new Map();
+  
+  // Map to track the cost from start to each position
+  const gScore: Map<string, number> = new Map();
+  gScore.set(`${start.x},${start.y}`, 0);
+  
+  // Map to track the estimated total cost from start to goal through each position
+  const fScore: Map<string, number> = new Map();
+  fScore.set(`${start.x},${start.y}`, heuristic(start));
+  
+  // Maximum iterations to prevent infinite loops
+  const maxIterations = 1000;
+  let iterations = 0;
+
+  while (openSet.length > 0 && iterations < maxIterations) {
+    iterations++;
+    
+    // Find the position in openSet with the lowest fScore
+    let current = openSet[0];
+    let lowestFScore = fScore.get(`${current.x},${current.y}`) || Infinity;
+    
+    for (let i = 1; i < openSet.length; i++) {
+      const pos = openSet[i];
+      const score = fScore.get(`${pos.x},${pos.y}`) || Infinity;
+      
+      if (score < lowestFScore) {
+        current = pos;
+        lowestFScore = score;
+      }
+    }
+    
+    // If we've reached the end, reconstruct and return the path
+    if (current.x === end.x && current.y === end.y) {
+      const path: Position[] = [current];
+      
+      let currentKey = `${current.x},${current.y}`;
+      while (cameFrom.has(currentKey)) {
+        current = cameFrom.get(currentKey)!;
+        path.unshift(current);
+        currentKey = `${current.x},${current.y}`;
+      }
+      
+      return path;
+    }
+    
+    // Remove current from openSet
+    openSet.splice(openSet.indexOf(current), 1);
+    
+    // Check each neighbor
+    const neighbors: Position[] = [
+      { x: current.x, y: current.y - 1 }, // up
+      { x: current.x, y: current.y + 1 }, // down
+      { x: current.x - 1, y: current.y }, // left
+      { x: current.x + 1, y: current.y }  // right
+    ];
+    
+    for (const neighbor of neighbors) {
+      // Skip if out of bounds
+      if (
+        neighbor.x < 0 || neighbor.x >= gameMap[0].length ||
+        neighbor.y < 0 || neighbor.y >= gameMap.length
+      ) {
+        continue;
+      }
+      
+      // Skip if not walkable
+      if (!gameMap[neighbor.y][neighbor.x].walkable) {
+        continue;
+      }
+      
+      // Calculate the tentative gScore
+      const tentativeGScore = (gScore.get(`${current.x},${current.y}`) || Infinity) + 1;
+      const neighborKey = `${neighbor.x},${neighbor.y}`;
+      
+      if (tentativeGScore < (gScore.get(neighborKey) || Infinity)) {
+        // This path to neighbor is better than any previous one
+        cameFrom.set(neighborKey, current);
+        gScore.set(neighborKey, tentativeGScore);
+        fScore.set(neighborKey, tentativeGScore + heuristic(neighbor));
+        
+        // Add neighbor to openSet if not already there
+        if (!openSet.some(pos => pos.x === neighbor.x && pos.y === neighbor.y)) {
+          openSet.push(neighbor);
+        }
+      }
+    }
+  }
+  
+  // No path found
+  return null;
+};
+
+// Check if a position is accessible from the player's position
+const isPositionAccessible = (
+  gameMap: Tile[][],
+  playerPos: Position, 
+  targetPos: Position
+): boolean => {
+  const path = findPath(gameMap, playerPos, targetPos);
+  return path !== null;
+};
+
+// Find a valid accessible position for NPCs or items
+const findAccessiblePosition = (
+  gameMap: Tile[][],
+  playerPos: Position,
+  maxAttempts: number = 50
+): Position | null => {
+  const width = gameMap[0]?.length || 0;
+  const height = gameMap.length || 0;
+  
+  if (width === 0 || height === 0) return null;
+  
+  // Try random positions
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    // Generate a random position (avoiding edges)
+    const x = Math.floor(Math.random() * (width - 4)) + 2;
+    const y = Math.floor(Math.random() * (height - 4)) + 2;
+    
+    // Check if the position is walkable
+    if (gameMap[y][x].walkable) {
+      // Check if it's accessible from the player's position
+      if (isPositionAccessible(gameMap, playerPos, { x, y })) {
+        return { x, y };
+      }
+    }
+  }
+  
+  // If random attempts fail, try a more systematic approach
+  // Try positions in expanding circles around the player
+  const maxRadius = Math.min(20, Math.max(width, height) / 2);
+  
+  for (let radius = 1; radius <= maxRadius; radius++) {
+    // Check positions around the player in a rough circle
+    for (let angle = 0; angle < 360; angle += 15) {
+      const radians = angle * (Math.PI / 180);
+      const x = Math.round(playerPos.x + radius * Math.cos(radians));
+      const y = Math.round(playerPos.y + radius * Math.sin(radians));
+      
+      // Check bounds
+      if (x < 0 || x >= width || y < 0 || y >= height) continue;
+      
+      // Check if walkable and accessible
+      if (gameMap[y][x].walkable && isPositionAccessible(gameMap, playerPos, { x, y })) {
+        return { x, y };
+      }
+    }
+  }
+  
+  // Last resort: use a position adjacent to the player
+  const adjacentPositions = [
+    { x: playerPos.x, y: playerPos.y - 1 }, // up
+    { x: playerPos.x, y: playerPos.y + 1 }, // down
+    { x: playerPos.x - 1, y: playerPos.y }, // left
+    { x: playerPos.x + 1, y: playerPos.y }  // right
+  ];
+  
+  for (const pos of adjacentPositions) {
+    if (
+      pos.x >= 0 && pos.x < width && pos.y >= 0 && pos.y < height &&
+      gameMap[pos.y][pos.x].walkable
+    ) {
+      return pos;
+    }
+  }
+  
+  // If all else fails, return null
+  return null;
+};
+
+// Create context
+type GameContextType = {
+  gameState: GameState;
+  // movePlayer: (direction: 'up' | 'down' | 'left' | 'right') => void; // Removed
+  interactWithNPC: (npcId: string) => void;
+  continueDialogue: () => void;
+  endDialogue: () => void;
+  toggleInventory: () => void;
+  toggleQuestLog: () => void;
+  toggleTutorial: () => void; // Add a function to toggle the tutorial visibility
+  acceptQuest: (questId: string) => void;
+  processVoiceCommand: (command: string) => void;
+  startVoiceRecognition: () => void;
+  stopVoiceRecognition: () => void;
+  isListening: boolean;
+  sendPlayerMessage: (message: string) => void;
+  checkForQuestProgress: () => void;
+  interactWithItem: () => void;
+  submitQuizAnswer: (answer: string) => void;
+  closeQuiz: () => void;
+};
+
+const GameContext = createContext<GameContextType | undefined>(undefined);
+
+export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+  // State for the entire game
+  const [gameState, setGameState] = useState<GameState>(() => {
+    // Generate initial game map and player position
+    const { map, playerSpawnPosition, npcPositions } = generateGameMap(50, 50);
+    
+    // Update NPCs with their positions
+    const npcsWithPositions = initialState.npcs.map(npc => ({
+      ...npc,
+      position: npcPositions[npc.id]
+    }));
+    
+    return {
+      ...initialState,
+      gameMap: map,
+      player: {
+        ...initialState.player,
+        position: playerSpawnPosition,
+        targetPosition: playerSpawnPosition,
+        visualPosition: playerSpawnPosition, // Initialize visual position same as actual position
+      },
+      npcs: npcsWithPositions
+    };
+  });
+
+  const [isListening, setIsListening] = useState(false);
+  const [heldKeys, setHeldKeys] = useState<Set<string>>(new Set()); // Track held movement keys
+
+  // Reference for the game loop
+  const gameLoopRef = useRef<number | null>(null);
+  const lastMoveTimeRef = useRef<number>(0); // Track last move time
+  const moveCooldown = 150; // Milliseconds between tile moves
+  const lastFrameTimeRef = useRef<number>(0); // For delta time calculation
+  const animationSpeed = 8; // Controls how fast the visual position catches up to actual position 
+  
+  // Utility function to calculate XP needed for a level
+  const calculateXpForLevel = (level: number): number => {
+    // Basic formula: each level requires 50 more XP than the previous one
+    return 100 + (level - 1) * 50;
+  };
+
+  // Function to handle level up, supporting multiple level-ups
+  const handleLevelUp = useCallback((currentLevel: number, newXp: number): { newLevel: number, finalXp: number, nextLevelXpThreshold: number } => {
+    let level = currentLevel;
+    let xp = newXp;
+    let changed = false;
+    let nextLevelXpThreshold = calculateXpForLevel(level);
+    
+    // Calculate all level-ups at once
+    const levelUps: number[] = []; // Store all new levels gained
+    
+    while (true) {
+      nextLevelXpThreshold = calculateXpForLevel(level); // Recalculate for the current level check
+      
+      if (xp >= nextLevelXpThreshold) {
+        // Level up
+        level++;
+        changed = true;
+        
+        // Save this level for animation
+        levelUps.push(level);
+        
+        // Calculate overflow XP
+        xp = xp - nextLevelXpThreshold;
+        
+        // Show toast notification
+        toast({
+          title: "Level Up!",
+          description: `You've reached level ${level}!`,
+          duration: 5000,
+        });
+      } else {
+        // No more level ups possible
+        break;
+      }
+    }
+    
+    // Calculate the threshold for the *next* level after potential level-ups
+    const finalNextLevelXpThreshold = calculateXpForLevel(level);
+    
+    // If the player didn't level up but XP changed, just update the XP
+    if (!changed && xp !== newXp) {
+      setGameState(prev => ({
+        ...prev,
+        player: {
+          ...prev.player,
+          xp: xp
+        }
+      }));
+    } 
+    // If player did level up, handle animations sequentially
+    else if (changed) {
+      // First, update to the new final level and XP values immediately
+      setGameState(prev => ({
+        ...prev,
+        player: {
+          ...prev.player,
+          level: level,
+          xp: xp,
+          nextLevelXp: finalNextLevelXpThreshold
+        }
+      }));
+      
+      // Then trigger level-up animations one at a time with delays
+      const triggerLevelUpAnimations = () => {
+        // Process each level-up animation sequentially
+        levelUps.forEach((newLevel, index) => {
+          // Stagger animations with a delay between each
+          setTimeout(() => {
+            setGameState(prev => ({
+              ...prev,
+              uiState: {
+                ...prev.uiState,
+                showLevelUp: true
+              }
+            }));
+            
+            // Hide animation after it plays
+            setTimeout(() => {
+              setGameState(prev => ({
+                ...prev,
+                uiState: {
+                  ...prev.uiState,
+                  showLevelUp: false
+                }
+              }));
+            }, 3000); // Animation duration
+          }, index * 3500); // Start next animation 3.5s after previous one starts
+        });
+      };
+      
+      // Start the animation sequence
+      triggerLevelUpAnimations();
+    }
+    
+    // Return the final values
+    return { newLevel: level, finalXp: xp, nextLevelXpThreshold: finalNextLevelXpThreshold };
+  }, [toast, setGameState]);
+  
+  // Speech synthesis for NPC dialogue
+  const speakText = useCallback((text: string) => {
+    if ('speechSynthesis' in window) {
+      // Cancel any ongoing speech first
+      window.speechSynthesis.cancel();
+      
+      const speech = new SpeechSynthesisUtterance(text);
+      speech.rate = 0.9; // Slightly slower than default
+      speech.pitch = 1;
+      
+      // Try to find a good voice
+      const voices = window.speechSynthesis.getVoices();
+      const preferredVoice = voices.find(voice => 
+        voice.name.includes('Google UK English') || 
+        voice.name.includes('Daniel') || 
+        voice.name.includes('Google US English')
+      );
+      
+      if (preferredVoice) {
+        speech.voice = preferredVoice;
+      }
+      
+      window.speechSynthesis.speak(speech);
+    }
+  }, []);
+  
+  // Initialize the game map
+  useEffect(() => {
+    const { map, playerSpawnPosition, npcPositions } = generateGameMap(60, 60);
+    
+    // Update NPC positions
+    const updatedNPCs = initialState.npcs.map(npc => ({
+      ...npc,
+      position: npcPositions[npc.id]
+    }));
+    
+    setGameState(prev => ({ 
+      ...prev, 
+      gameMap: map,
+      player: {
+        ...prev.player,
+        position: playerSpawnPosition,
+        targetPosition: playerSpawnPosition
+      },
+      npcs: updatedNPCs
+    }));
+  }, []);
+
+  // Check for NPC interaction based on player position
+  useEffect(() => {
+    const { position } = gameState.player;
+    const nearbyNPC = gameState.npcs.find(npc => 
+      Math.abs(npc.position.x - position.x) <= 1 && 
+      Math.abs(npc.position.y - position.y) <= 1
+    );
+    
+    if (nearbyNPC && !gameState.activeDialogue.active) {
+      toast({
+        title: `${nearbyNPC.name} is nearby!`,
+        description: "Press E or say 'Talk' to interact",
+        duration: 3000,
+      });
+    }
+  }, [gameState.player, gameState.npcs, gameState.activeDialogue.active]);
+
+  // Fallback to static dialogue if AI fails
+  const fallbackToStaticDialogue = useCallback((npc: NPC) => {
+    if (npc.dialogue.length > 0) {
+      const firstLine = npc.dialogue[0];
+      speakText(firstLine);
+      
+      setGameState(prev => ({
+        ...prev,
+        activeDialogue: {
+          npc: {
+            ...npc,
+            dialogue: [firstLine]
+          },
+          active: true,
+          currentResponseIndex: 0
+        },
+        currentConversationHistory: [...prev.currentConversationHistory, `${npc.name}: ${firstLine}`]
+      }));
+    }
+  }, [speakText]);
+  
+  // Generate AI greeting when starting conversation
+  const sendAIGreeting = useCallback(async (npc: NPC) => {
+    try {
+      // Prepare context-aware greeting prompt
+      const prompt = `
+You are ${npc.name} in the game "Mystic Realms", a fantasy RPG. 
+${npc.personality || "You are a friendly and helpful NPC."}
+
+Game context:
+- You are greeting the player for the first time in this conversation
+- You should introduce yourself briefly and hint at your role or quest
+- Stay in character and match your personality description
+- Keep your greeting concise (1-2 sentences max)
+
+${npc.quest ? `You have a quest called "${npc.quest.title}" that you want to tell the player about: ${npc.quest.description}` : ""}
+
+Respond as ${npc.name} would in character, with a brief, welcoming greeting.
+      `;
+      
+      // Define response schema for structured output
+      const responseSchema = { 
+        type: "object", 
+        properties: { 
+          response: { 
+            type: "string", 
+            description: "The NPC's greeting" 
+          }
+        }, 
+        required: ["response"] 
+      };
+      
+      // Prepare payload for Gemini API
+      const payload = { 
+        contents: [{ 
+          parts: [{ text: prompt }] 
+        }], 
+        generationConfig: { 
+          response_mime_type: 'application/json', 
+          response_schema: responseSchema 
+        } 
+      };
+      
+      // Call Gemini API
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        }
+      );
+      
+      if (!response.ok) {
+        throw new Error(`API error: ${response.status}`);
+      }
+      
+      const data = await response.json();
+      let aiGreeting = "";
+      
+      try {
+        // Extract the AI response from the JSON structure
+        if (data.candidates && 
+            data.candidates[0]?.content?.parts && 
+            data.candidates[0].content.parts[0]?.functionResponse?.response) {
+          aiGreeting = data.candidates[0].content.parts[0].functionResponse.response;
+        } else if (data.candidates && 
+                  data.candidates[0]?.content?.parts && 
+                  data.candidates[0].content.parts[0]?.text) {
+          // Parse the text if it's in JSON format
+          const textContent = data.candidates[0].content.parts[0].text;
+          try {
+            const jsonResponse = JSON.parse(textContent);
+            if (jsonResponse.response) {
+              aiGreeting = jsonResponse.response;
+            }
+          } catch (e) {
+            // If not valid JSON, use the text directly if it's not too long
+            if (textContent.length < 200) {
+              aiGreeting = textContent;
+            }
+          }
+        }
+      } catch (e) {
+        console.error("Error parsing AI greeting:", e);
+      }
+      
+      if (aiGreeting) {
+        // Speak the AI greeting
+        speakText(aiGreeting);
+        
+        // Update the NPC dialogue with the AI greeting
+        setGameState(prev => {
+          const updatedNpcs = prev.npcs.map(n => {
+            if (n.id === npc.id) {
+              return {
+                ...n,
+                dialogue: [aiGreeting, ...n.dialogue] // Add as first dialogue entry
+              };
+            }
+            return n;
+          });
+          
+          return {
+            ...prev,
+            npcs: updatedNpcs,
+            activeDialogue: {
+              ...prev.activeDialogue,
+              npc: {
+                ...prev.activeDialogue.npc!,
+                dialogue: [aiGreeting]
+              }
+            },
+            currentConversationHistory: [...prev.currentConversationHistory, `${npc.name}: ${aiGreeting}`]
+          };
+        });
+      } else {
+        // Fallback to first dialogue line if AI fails
+        fallbackToStaticDialogue(npc);
+      }
+    } catch (error) {
+      console.error("Error generating AI greeting:", error);
+      fallbackToStaticDialogue(npc);
+    }
+  }, [speakText, fallbackToStaticDialogue]);
+  
+  // Utility function to check proximity (for quests and items)
+  const isInProximity = (pos1: Position, pos2: Position, radius: number = 1): boolean => {
+    return Math.abs(pos1.x - pos2.x) <= radius && Math.abs(pos1.y - pos2.y) <= radius;
+  };
+
+  // Function to check for quest progress and update objectives
+  const checkForQuestProgress = useCallback(() => {
+    setGameState(prev => {
+      const { player, activeQuests, questItems, npcs } = prev;
+      if (activeQuests.length === 0) return prev; // No active quests to check
+      
+      let questUpdated = false;
+      let updatedQuests = [...activeQuests];
+      let updatedQuestItems = [...questItems];
+      let updatedInventory = [...prev.inventory];
+      
+      // Check each active quest
+      updatedQuests = updatedQuests.map(quest => {
+        if (quest.completed) return quest;
+        
+        // Copy the quest to modify its objectives
+        const updatedQuest = { ...quest };
+        let questObjectivesCompleted = true;
+        
+        // Check each objective in the quest
+        updatedQuest.objectives = quest.objectives.map(objective => {
+          // Skip already completed objectives
+          if (objective.completed) return objective;
+          
+          switch (objective.type) {
+            case 'location':
+              // Check if player is at the required location
+              if (objective.targetPosition && 
+                  isInProximity(player.position, objective.targetPosition, 2)) {
+                
+                toast({
+                  title: "Quest Update",
+                  description: `Objective completed: ${objective.description}`,
+                  duration: 3000,
+                });
+                
+                questUpdated = true;
+                return { ...objective, completed: true };
+              }
+              break;
+              
+            case 'collect':
+              // Special case for firebloom petals in the Alchemist quest
+              if (quest.id === 'quest3' && objective.id === 'q3_obj1') {
+                // Check if player is near any firebloom petal
+                const targetItem = questItems.find(item => 
+                  item.name === 'Firebloom Petal' && 
+                  isInProximity(player.position, item.position, 1)
+                );
+                
+                if (targetItem) {
+                  // Increase progress count and check if complete
+                  const newProgress = (objective.currentProgress || 0) + 1;
+                  const isComplete = newProgress >= (objective.count || 1);
+                  
+                  // Remove the item from the world
+                  updatedQuestItems = updatedQuestItems.filter(item => item.id !== targetItem.id);
+                  
+                  // Add the item to player inventory
+                  const inventoryItem: Item = {
+                    ...targetItem,
+                    position: undefined // Remove position from inventory items
+                  };
+                  updatedInventory.push(inventoryItem);
+                  
+                  toast({
+                    title: "Item Collected",
+                    description: `You found: ${targetItem.name}`,
+                    duration: 3000,
+                  });
+                  
+                  if (isComplete) {
+                    toast({
+                      title: "Quest Update",
+                      description: `Objective completed: ${objective.description}`,
+                      duration: 3000,
+                    });
+                  } else {
+                    toast({
+                      title: "Quest Update",
+                      description: `Progress: ${newProgress}/${objective.count}`,
+                      duration: 3000,
+                    });
+                  }
+                  
+                  questUpdated = true;
+                  return { 
+                    ...objective, 
+                    currentProgress: newProgress,
+                    completed: isComplete
+                  };
+                }
+              } else {
+                // Default behavior for other collect objectives
+                const targetItem = questItems.find(item => 
+                  item.id === objective.targetId && 
+                  isInProximity(player.position, item.position, 1)
+                );
+                
+                if (targetItem) {
+                  // Increase progress count and check if complete
+                  const newProgress = (objective.currentProgress || 0) + 1;
+                  const isComplete = newProgress >= (objective.count || 1);
+                  
+                  // Remove the item from the world
+                  updatedQuestItems = updatedQuestItems.filter(item => item.id !== targetItem.id);
+                  
+                  // Add the item to player inventory
+                  const inventoryItem: Item = {
+                    ...targetItem,
+                    position: undefined // Remove position from inventory items
+                  };
+                  updatedInventory.push(inventoryItem);
+                  
+                  toast({
+                    title: "Item Collected",
+                    description: `You found: ${targetItem.name}`,
+                    duration: 3000,
+                  });
+                  
+                  if (isComplete) {
+                    toast({
+                      title: "Quest Update",
+                      description: `Objective completed: ${objective.description}`,
+                      duration: 3000,
+                    });
+                  } else {
+                    toast({
+                      title: "Quest Update",
+                      description: `Progress: ${newProgress}/${objective.count}`,
+                      duration: 3000,
+                    });
+                  }
+                  
+                  questUpdated = true;
+                  return { 
+                    ...objective, 
+                    currentProgress: newProgress,
+                    completed: isComplete
+                  };
+                }
+              }
+              break;
+              
+            case 'interact':
+              // Check if player is interacting with the target NPC
+              if (prev.activeDialogue.active && prev.activeDialogue.npc) {
+                const npc = prev.activeDialogue.npc;
+                if (objective.targetId === npc.id) {
+                  // Only complete if all other objectives are done
+                  const otherObjectivesComplete = quest.objectives
+                    .filter(obj => obj.id !== objective.id)
+                    .every(obj => obj.completed);
+                  
+                  if (otherObjectivesComplete) {
+                    toast({
+                      title: "Quest Update",
+                      description: `Objective completed: ${objective.description}`,
+                      duration: 3000,
+                    });
+                    
+                    questUpdated = true;
+                    return { ...objective, completed: true };
+                  }
+                }
+              }
+              break;
+          }
+          
+          // If we get here, the objective is not completed
+          questObjectivesCompleted = false;
+          return objective;
+        });
+        
+        // Check if all objectives are completed
+        if (questObjectivesCompleted && !quest.completed) {
+          updatedQuest.completed = true;
+          
+          // Find the NPC who gave the quest
+          const questNPC = npcs.find(npc => npc.id === quest.npcId);
+          
+          toast({
+            title: "Quest Completed!",
+            description: `${quest.title} has been completed.`,
+            duration: 5000,
+          });
+          
+          // Could add rewards here if needed
+        }
+        
+        return updatedQuest;
+      });
+      
+      // Move completed quests to the completedQuests array
+      const stillActiveQuests = updatedQuests.filter(q => !q.completed);
+      const newCompletedQuests = [
+        ...prev.completedQuests,
+        ...updatedQuests.filter(q => q.completed)
+      ];
+      
+      // Only update state if something changed
+      if (questUpdated) {
+        return {
+          ...prev,
+          activeQuests: stillActiveQuests,
+          completedQuests: newCompletedQuests,
+          questItems: updatedQuestItems,
+          inventory: updatedInventory
+        };
+      }
+      
+      return prev;
+    });
+  }, []);
+
+  // Function to check if a position is walkable
+  const isTileWalkable = (position: Position): boolean => {
+    const { x, y } = position;
+    // Check bounds
+    if (x < 0 || y < 0 || x >= gameState.gameMap[0]?.length || y >= gameState.gameMap.length) {
+      return false;
+    }
+    // Check if the tile is walkable
+    return gameState.gameMap[y][x].walkable;
+  };
+
+  // Function to find a valid position for a quest item
+  const findValidQuestItemPosition = (maxAttempts: number = 30): Position => {
+    // Get map dimensions
+    const width = gameState.gameMap[0]?.length || 50;
+    const height = gameState.gameMap.length || 50;
+    
+    let attempts = 0;
+    while (attempts < maxAttempts) {
+      // Generate random coordinates (avoid edges)
+      const x = Math.floor(Math.random() * (width - 4)) + 2;
+      const y = Math.floor(Math.random() * (height - 4)) + 2;
+      
+      // Check if the position is walkable
+      if (isTileWalkable({ x, y })) {
+        return { x, y };
+      }
+      
+      attempts++;
+    }
+    
+    // Fallback to a reasonable position if no valid position found
+    return { x: 25, y: 25 };
+  };
+
+  // Find a valid position for a quest item
+  const findValidPositionForQuestItem = (gameMap: Tile[][], playerPosition: Position): Position => {
+    const width = gameMap[0]?.length || 50;
+    const height = gameMap.length || 50;
+    
+    let attempts = 0;
+    const maxAttempts = 30;
+    
+    while (attempts < maxAttempts) {
+      // Generate random coordinates (avoid edges)
+      const x = Math.floor(Math.random() * (width - 4)) + 2;
+      const y = Math.floor(Math.random() * (height - 4)) + 2;
+      
+      // Check if the tile is walkable and accessible
+      if (x >= 0 && y >= 0 && x < width && y < height && 
+          gameMap[y][x].walkable && 
+          isPositionAccessible(gameMap, playerPosition, { x, y })) {
+        return { x, y };
+      }
+      
+      attempts++;
+    }
+    
+    // If random attempts fail, find a forced accessible position
+    const accessiblePosition = findAccessiblePosition(gameMap, playerPosition);
+    if (accessiblePosition) {
+      return accessiblePosition;
+    }
+    
+    // Last resort fallback
+    return { 
+      x: Math.min(width - 2, Math.max(1, playerPosition.x + 1)),
+      y: Math.min(height - 2, Math.max(1, playerPosition.y + 1))
+    };
+  };
+
+  // Function to interact with nearby NPCs
+  const interactWithNPC = useCallback((npcId: string) => {
+    const targetNpc = gameState.npcs.find(n => n.id === npcId);
+    if (!targetNpc) return;
+
+    // Check if the NPC's quiz has been passed
+    if (!targetNpc.hasPassedQuiz) {
+      // Get a random quiz for this NPC's topic
+      const randomQuiz = getRandomQuizForTopic(targetNpc.quizTopic);
+      
+      // Activate the quiz for this NPC with the random quiz data
+      setGameState(prev => ({
+        ...prev,
+        activeQuiz: {
+          npcId,
+          active: true,
+          playerAnswer: '',
+          currentQuiz: randomQuiz
+        }
+      }));
+      
+      toast({
+        title: "Python Quiz",
+        description: `Answer correctly to unlock interaction with ${targetNpc.name}`,
+        duration: 3000,
+      });
+      
+      return;
+    }
+    
+    // Continue with normal NPC interaction if quiz is passed
+    setGameState(prev => {
+      const npc = prev.npcs.find(n => n.id === npcId);
+      if (!npc) return prev;
+      
+      let updatedActiveQuests = [...prev.activeQuests];
+      let updatedCompletedQuests = [...prev.completedQuests];
+      let updatedInventory = [...prev.inventory];
+      let questTurnedIn = false;
+      let questReward: Item | null = null;
+      let newQuestAccepted = false;
+      let newQuestItemIds: string[] = [];
+      let completedQuestTitle = "";
+      let completedQuest: Quest | null = null;
+      
+      // Track player level and XP
+      let playerLevel = prev.player.level;
+      let playerXp = prev.player.xp;
+      let playerNextLevelXp = prev.player.nextLevelXp;
+      let playerLeveledUp = false;
+      
+      // First check if this NPC is involved in any active quest completion
+      updatedActiveQuests.forEach(quest => {
+        if (quest.npcId === npcId) {
+          // Check if this is the final "return to NPC" objective
+          const finalObjective = quest.objectives.find(obj => 
+            obj.type === 'interact' && obj.targetId === npcId
+          );
+          
+          if (finalObjective && !finalObjective.completed) {
+            // Check if all other objectives are completed
+            const otherObjectivesComplete = quest.objectives
+              .filter(obj => obj.id !== finalObjective.id)
+              .every(obj => obj.completed);
+            
+            if (otherObjectivesComplete) {
+              // All objectives are complete, mark this quest for completion
+              quest.objectives = quest.objectives.map(obj => ({
+                ...obj,
+                completed: true
+              }));
+              quest.completed = true;
+              questTurnedIn = true;
+              completedQuestTitle = quest.title;
+              completedQuest = quest;
+              
+              // Move to completed quests
+              updatedActiveQuests = updatedActiveQuests.filter(q => q.id !== quest.id);
+              updatedCompletedQuests.push(quest);
+              
+              // Add reward if applicable
+              if (quest.reward) {
+                questReward = quest.reward;
+                updatedInventory.push(quest.reward);
+              }
+              
+              // Award XP for the quest
+              const questXp = quest.xpReward || 0;
+              const totalXp = playerXp + questXp;
+              
+              // Handle level ups from quest XP
+              const levelUpResult = handleLevelUp(playerLevel, totalXp);
+              
+              // Update tracking variables based on level-up results
+              playerLevel = levelUpResult.newLevel;
+              playerXp = levelUpResult.finalXp; // Use the final XP from the result
+              playerNextLevelXp = levelUpResult.nextLevelXpThreshold; // Use the correct next threshold
+              
+              // Check if a level up actually occurred
+              if (levelUpResult.newLevel > prev.player.level) {
+                playerLeveledUp = true;
+              }
+              
+              // Show XP gained notification
+              toast({
+                title: "Experience Gained",
+                description: `+${questXp} XP`,
+                duration: 3000,
+              });
+            }
+          }
+        }
+      });
+      
+      // If NPC has a new quest and it's not already active or completed
+      if (npc.quest && 
+          !prev.activeQuests.some(q => q.id === npc.quest?.id) && 
+          !prev.completedQuests.some(q => q.id === npc.quest?.id)) {
+        
+        // Create enhanced quest with objectives based on the NPC's quest type
+        const enhancedQuest = enhanceQuestWithObjectives(npc.quest, npc.id, prev.questItems);
+        
+        // Add the enhanced quest to active quests
+        updatedActiveQuests = [...updatedActiveQuests, enhancedQuest];
+        
+        // Mark that a new quest was accepted, and which items should be revealed
+        newQuestAccepted = true;
+        newQuestItemIds = enhancedQuest.relatedQuestItemIds;
+        
+        // Show quest activation notification
+        toast({
+          title: `New Quest: ${enhancedQuest.title}`,
+          description: enhancedQuest.description,
+          duration: 5000,
+        });
+      }
+      
+      // Display quest completion notification if applicable
+      if (questTurnedIn) {
+        toast({
+          title: "Quest Completed!",
+          description: questReward 
+            ? `You received: ${questReward.name}` 
+            : "Thanks for your help!",
+          duration: 5000,
+        });
+      }
+      
+      // Set the AI response loading state
+      const npcWithLoading = {
+        ...npc,
+        dialogue: ["..."]  // Start with an empty loading state
+      };
+      
+      const updatedState = {
+        ...prev,
+        player: {
+          ...prev.player,
+          level: playerLevel,
+          xp: playerXp,
+          nextLevelXp: playerNextLevelXp
+        },
+        activeDialogue: {
+          npc: npcWithLoading,
+          active: true,
+          currentResponseIndex: 0
+        },
+        activeQuests: updatedActiveQuests,
+        completedQuests: updatedCompletedQuests,
+        inventory: updatedInventory,
+        currentConversationHistory: [], // Reset conversation history
+        uiState: {
+          ...prev.uiState,
+          showLevelUp: playerLeveledUp
+        }
+      };
+      
+      // If a new quest was accepted, reveal its quest items
+      if (newQuestAccepted) {
+        // Find the hidden items related to this quest
+        const itemsToReveal = prev.hiddenQuestItems.filter(item => 
+          newQuestItemIds.includes(item.id)
+        );
+        
+        if (itemsToReveal.length > 0) {
+          // Move items from hidden to visible
+          return {
+            ...updatedState,
+            questItems: [...prev.questItems, ...itemsToReveal],
+            hiddenQuestItems: prev.hiddenQuestItems.filter(item => 
+              !newQuestItemIds.includes(item.id)
+            )
+          };
+        }
+      }
+      
+      return updatedState;
+    });
+    
+    // Generate AI response immediately
+    const npc = gameState.npcs.find(n => n.id === npcId);
+    if (npc) {
+      // Check if a quest was just completed
+      const completedQuest = gameState.activeQuests.find(quest => 
+        quest.npcId === npcId && 
+        quest.objectives.every(obj => obj.completed) && 
+        !quest.completed
+      );
+      
+      if (completedQuest) {
+        // Send a special quest completion greeting
+        sendQuestCompletionGreeting(npc, completedQuest);
+        
+        // Add a visual indicator for quest completion
+        const npcElement = document.querySelector(`[data-npc-id="${npcId}"]`);
+        if (npcElement) {
+          npcElement.classList.add('quest-completed-glow');
+          setTimeout(() => {
+            npcElement.classList.remove('quest-completed-glow');
+          }, 3000);
+        }
+      } else {
+        // Get AI response for initial greeting
+        sendAIGreeting(npc);
+      }
+    }
+  }, [gameState.npcs, gameState.questItems, gameState.hiddenQuestItems, gameState.activeQuests, sendAIGreeting, toast, handleLevelUp]);
+
+  // Generate AI quest completion greeting
+  const sendQuestCompletionGreeting = useCallback(async (npc: NPC, quest: Quest) => {
+    try {
+      // Prepare context-aware quest completion prompt
+      const prompt = `
+You are ${npc.name} in the game "Mystic Realms", a fantasy RPG. 
+${npc.personality || "You are a friendly and helpful NPC."}
+
+Game context:
+- The player has just completed the quest "${quest.title}"
+- You should express gratitude and satisfaction with their work
+- Mention the impact of their actions on the world
+- If there's a reward, mention it briefly
+- Stay in character and match your personality description
+- Keep your response concise (2-3 sentences max)
+
+Respond as ${npc.name} would in character, with a brief, grateful acknowledgment of the completed quest.
+      `;
+      
+      // Define response schema for structured output
+      const responseSchema = { 
+        type: "object", 
+        properties: { 
+          response: { 
+            type: "string", 
+            description: "The NPC's quest completion greeting" 
+          }
+        }, 
+        required: ["response"] 
+      };
+      
+      // Prepare payload for Gemini API
+      const payload = { 
+        contents: [{ 
+          parts: [{ text: prompt }] 
+        }], 
+        generationConfig: { 
+          response_mime_type: 'application/json', 
+          response_schema: responseSchema 
+        } 
+      };
+      
+      // Call Gemini API
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        }
+      );
+      
+      if (!response.ok) {
+        throw new Error(`API error: ${response.status}`);
+      }
+      
+      const data = await response.json();
+      let aiGreeting = "";
+      
+      try {
+        // Extract the AI response from the JSON structure
+        if (data.candidates && 
+            data.candidates[0]?.content?.parts && 
+            data.candidates[0].content.parts[0]?.functionResponse?.response) {
+          aiGreeting = data.candidates[0].content.parts[0].functionResponse.response;
+        } else if (data.candidates && 
+                  data.candidates[0]?.content?.parts && 
+                  data.candidates[0].content.parts[0]?.text) {
+          // Parse the text if it's in JSON format
+          const textContent = data.candidates[0].content.parts[0].text;
+          try {
+            const jsonResponse = JSON.parse(textContent);
+            if (jsonResponse.response) {
+              aiGreeting = jsonResponse.response;
+            }
+          } catch (e) {
+            // If not valid JSON, use the text directly if it's not too long
+            if (textContent.length < 200) {
+              aiGreeting = textContent;
+            }
+          }
+        }
+      } catch (e) {
+        console.error("Error parsing AI quest completion greeting:", e);
+      }
+      
+      if (aiGreeting) {
+        // Speak the AI greeting
+        speakText(aiGreeting);
+        
+        // Update the NPC dialogue with the AI greeting
+        setGameState(prev => {
+          const updatedNpcs = prev.npcs.map(n => {
+            if (n.id === npc.id) {
+              return {
+                ...n,
+                dialogue: [aiGreeting, ...n.dialogue] // Add as first dialogue entry
+              };
+            }
+            return n;
+          });
+          
+          return {
+            ...prev,
+            npcs: updatedNpcs,
+            activeDialogue: {
+              ...prev.activeDialogue,
+              npc: {
+                ...prev.activeDialogue.npc!,
+                dialogue: [aiGreeting]
+              }
+            },
+            currentConversationHistory: [...prev.currentConversationHistory, `${npc.name}: ${aiGreeting}`]
+          };
+        });
+      } else {
+        // Fallback to a generic quest completion message
+        const fallbackMessage = `Thank you for completing the quest "${quest.title}"! Your help has made a real difference.`;
+        speakText(fallbackMessage);
+        
+        setGameState(prev => {
+          const updatedNpcs = prev.npcs.map(n => {
+            if (n.id === npc.id) {
+              return {
+                ...n,
+                dialogue: [fallbackMessage, ...n.dialogue]
+              };
+            }
+            return n;
+          });
+          
+          return {
+            ...prev,
+            npcs: updatedNpcs,
+            activeDialogue: {
+              ...prev.activeDialogue,
+              npc: {
+                ...prev.activeDialogue.npc!,
+                dialogue: [fallbackMessage]
+              }
+            },
+            currentConversationHistory: [...prev.currentConversationHistory, `${npc.name}: ${fallbackMessage}`]
+          };
+        });
+      }
+    } catch (error) {
+      console.error("Error generating AI quest completion greeting:", error);
+      
+      // Fallback to a generic quest completion message
+      const fallbackMessage = `Thank you for completing the quest "${quest.title}"! Your help has made a real difference.`;
+      speakText(fallbackMessage);
+      
+      setGameState(prev => {
+        const updatedNpcs = prev.npcs.map(n => {
+          if (n.id === npc.id) {
+            return {
+              ...n,
+              dialogue: [fallbackMessage, ...n.dialogue]
+            };
+          }
+          return n;
+        });
+        
+        return {
+          ...prev,
+          npcs: updatedNpcs,
+          activeDialogue: {
+            ...prev.activeDialogue,
+            npc: {
+              ...prev.activeDialogue.npc!,
+              dialogue: [fallbackMessage]
+            }
+          },
+          currentConversationHistory: [...prev.currentConversationHistory, `${npc.name}: ${fallbackMessage}`]
+        };
+      });
+    }
+  }, [speakText]);
+
+  // Enhance a basic quest with objectives based on the quest type and NPC
+  const enhanceQuestWithObjectives = (quest: Quest, npcId: string, questItems: QuestItem[]): Quest => {
+    // Start with a copy of the quest
+    const enhancedQuest: Quest = {
+      ...quest,
+      active: true,
+      objectives: [],
+      relatedQuestItemIds: [],
+      npcId
+    };
+    
+    // Generate objectives based on quest ID
+    switch (quest.id) {
+      case 'quest1': // The Fading Crystals (Elder Mystic)
+        // Objectives: Find the two crystals and return them to the Elder
+        enhancedQuest.objectives = [
+          {
+            id: 'q1_obj1',
+            description: 'Find the Fading Crystal',
+            type: 'collect',
+            targetId: 'questItem1', // Blue crystal
+            completed: false,
+            currentProgress: 0,
+            count: 1
+          },
+          {
+            id: 'q1_obj2',
+            description: 'Find the Ancient Crystal',
+            type: 'collect',
+            targetId: 'questItem2', // Green crystal
+            completed: false,
+            currentProgress: 0,
+            count: 1
+          },
+          {
+            id: 'q1_obj3',
+            description: 'Return to the Elder Mystic',
+            type: 'interact',
+            targetId: 'npc1',
+            completed: false
+          }
+        ];
+        // Items that should appear in the world for this quest
+        enhancedQuest.relatedQuestItemIds = ['questItem1', 'questItem2'];
+        break;
+        
+      case 'quest2': // Strange Disturbances (Ranger Thorne)
+        // Objectives: Investigate ruins, find evidence, and report back
+        enhancedQuest.objectives = [
+          {
+            id: 'q2_obj1',
+            description: 'Investigate the eastern ruins',
+            type: 'location',
+            targetPosition: { x: 38, y: 32 }, // Position of the ruins
+            completed: false
+          },
+          {
+            id: 'q2_obj2',
+            description: 'Find evidence of creatures',
+            type: 'collect',
+            targetId: 'questItem4', // Strange footprints
+            completed: false,
+            currentProgress: 0,
+            count: 1
+          },
+          {
+            id: 'q2_obj3',
+            description: 'Report back to Ranger Thorne',
+            type: 'interact',
+            targetId: 'npc3',
+            completed: false
+          }
+        ];
+        // Items that should appear in the world for this quest
+        enhancedQuest.relatedQuestItemIds = ['questItem4'];
+        break;
+        
+      case 'quest3': // Alchemical Wonders (Alchemist Vex)
+        // Objectives: Collect 3 firebloom petals and return to Vex
+        enhancedQuest.objectives = [
+          {
+            id: 'q3_obj1',
+            description: 'Collect firebloom petals',
+            type: 'collect',
+            targetId: 'questItem3_1', // We use any petal ID, but match by name
+            completed: false,
+            currentProgress: 0,
+            count: 3
+          },
+          {
+            id: 'q3_obj2',
+            description: 'Return to Alchemist Vex',
+            type: 'interact',
+            targetId: 'npc4',
+            completed: false
+          }
+        ];
+        // Items that should appear in the world for this quest (all three petals)
+        enhancedQuest.relatedQuestItemIds = ['questItem3_1', 'questItem3_2', 'questItem3_3'];
+        break;
+        
+      case 'quest4': // The Lost Map Piece (Merchant Ryla)
+        // Objectives: Find the map piece and return to Ryla
+        enhancedQuest.objectives = [
+          {
+            id: 'q4_obj1',
+            description: 'Find the missing map piece',
+            type: 'collect',
+            targetId: 'questItem5', // The map piece item
+            completed: false,
+            currentProgress: 0,
+            count: 1
+          },
+          {
+            id: 'q4_obj2',
+            description: 'Return to Merchant Ryla',
+            type: 'interact',
+            targetId: 'npc2', // Ryla's ID
+            completed: false
+          }
+        ];
+        // Item that should appear in the world for this quest
+        enhancedQuest.relatedQuestItemIds = ['questItem5'];
+        break;
+        
+      default:
+        // Generic quest structure if we don't have a specific template
+        enhancedQuest.objectives = [
+          {
+            id: `${quest.id}_obj1`,
+            description: `Complete ${quest.title}`,
+            type: 'interact',
+            targetId: npcId,
+            completed: false
+          }
+        ];
+    }
+    
+    return enhancedQuest;
+  };
+
+  // Function to update player position based on held keys
+  const updatePlayerPosition = useCallback(() => {
+    setGameState(prev => {
+      // Don't allow movement during dialogue, quiz, or level up animation (if implemented)
+      if (prev.activeDialogue.active || prev.activeQuiz.active /* || prev.uiState.isLevelUpAnimationActive */) {
+        // Ensure isMoving is false if blocked
+        if (prev.player.isMoving) {
+           return { ...prev, player: { ...prev.player, isMoving: false } };
+        }
+        return prev;
+      }
+
+      const currentTime = performance.now();
+      let dx = 0;
+      let dy = 0;
+      let newDirection = prev.player.direction;
+      let isTryingToMove = false;
+
+      // Determine movement direction based on held keys
+      if (heldKeys.has('w') || heldKeys.has('arrowup')) {
+        dy = -1; // Move one tile up
+        newDirection = 'up';
+        isTryingToMove = true;
+      } else if (heldKeys.has('s') || heldKeys.has('arrowdown')) {
+        dy = 1; // Move one tile down
+        newDirection = 'down';
+        isTryingToMove = true;
+      } else if (heldKeys.has('a') || heldKeys.has('arrowleft')) {
+        dx = -1; // Move one tile left
+        newDirection = 'left';
+        isTryingToMove = true;
+      } else if (heldKeys.has('d') || heldKeys.has('arrowright')) {
+        dx = 1; // Move one tile right
+        newDirection = 'right';
+        isTryingToMove = true;
+      }
+
+      // If no movement keys are held
+      if (!isTryingToMove) {
+         if (prev.player.isMoving) {
+            return { ...prev, player: { ...prev.player, isMoving: false } };
+         }
+         return prev; // No changes needed
+      }
+
+      // Calculate potential new grid position (only move one tile)
+      const potentialNewX = prev.player.position.x + dx;
+      const potentialNewY = prev.player.position.y + dy;
+
+      // Check bounds and walkability
+      const canMove =
+        potentialNewX >= 0 && potentialNewX < (prev.gameMap[0]?.length || 0) &&
+        potentialNewY >= 0 && potentialNewY < prev.gameMap.length &&
+        prev.gameMap[potentialNewY][potentialNewX].walkable;
+
+      if (canMove) {
+        // Check for collision with NPCs
+        const npcCollision = prev.npcs.some(npc =>
+          npc.position.x === potentialNewX && npc.position.y === potentialNewY
+        );
+
+        if (!npcCollision) {
+          // Check cooldown
+          if (currentTime - lastMoveTimeRef.current >= moveCooldown) {
+            // Valid move and cooldown passed: Update position and reset cooldown timer
+            lastMoveTimeRef.current = currentTime;
+            return {
+              ...prev,
+              player: {
+                ...prev.player,
+                position: { x: potentialNewX, y: potentialNewY },
+                targetPosition: { x: potentialNewX, y: potentialNewY }, // Update target position 
+                isMoving: true, // Start/continue moving animation
+                direction: newDirection,
+                sprite: `player_${newDirection}`
+              }
+            };
+          } else {
+             // Valid move but cooldown active: Keep moving state, update direction
+             return {
+               ...prev,
+               player: {
+                 ...prev.player,
+                 isMoving: true, // Keep showing moving sprite/animation
+                 direction: newDirection,
+                 sprite: `player_${newDirection}`
+               }
+             };
+          }
+        }
+      }
+
+      // If move is invalid (wall, NPC, bounds, or already on cooldown for a valid tile),
+      // stop moving state but update direction.
+      return {
+        ...prev,
+        player: {
+          ...prev.player,
+          isMoving: false, // Stop moving state if blocked or waiting for cooldown
+          direction: newDirection,
+          sprite: `player_${newDirection}`
+        }
+      };
+    });
+    // No dependency on lastMoveTimeRef here, it's managed internally via ref
+  }, [heldKeys, setGameState, moveCooldown]);
+
+  // New function to update visual position (animate toward actual position)
+  const updateVisualPosition = useCallback(() => {
+    setGameState(prev => {
+      const currentTime = performance.now();
+      const deltaTime = (currentTime - lastFrameTimeRef.current) / 1000; // time in seconds
+      lastFrameTimeRef.current = currentTime;
+      
+      const { visualPosition, position } = prev.player;
+      
+      // Calculate the distance between visual and actual position
+      const dx = position.x - visualPosition.x;
+      const dy = position.y - visualPosition.y;
+      
+      // If already at the target, no need to update
+      if (Math.abs(dx) < 0.01 && Math.abs(dy) < 0.01) {
+        return prev;
+      }
+      
+      // Move visualPosition toward position based on animation speed and delta time
+      const newVisualPosition = {
+        x: visualPosition.x + dx * Math.min(1, animationSpeed * deltaTime),
+        y: visualPosition.y + dy * Math.min(1, animationSpeed * deltaTime)
+      };
+      
+      return {
+        ...prev,
+        player: {
+          ...prev.player,
+          visualPosition: newVisualPosition
+        }
+      };
+    });
+  }, [animationSpeed]);
+
+  // Game loop for smooth movement
+  useEffect(() => {
+    const gameLoop = (timestamp: number) => {
+      updatePlayerPosition(); // Update grid position based on input
+      updateVisualPosition(); // Smoothly animate visual position toward grid position
+      gameLoopRef.current = requestAnimationFrame(gameLoop);
+    };
+
+    lastFrameTimeRef.current = performance.now(); // Initialize last frame time
+    // Start the game loop
+    gameLoopRef.current = requestAnimationFrame(gameLoop);
+
+    // Cleanup function to cancel the loop when the component unmounts
+    return () => {
+      if (gameLoopRef.current) {
+        cancelAnimationFrame(gameLoopRef.current);
+      }
+    };
+  }, [updatePlayerPosition, updateVisualPosition]);
+
+  // Function to continue to the next dialogue line
+  const continueDialogue = useCallback(() => {
+    setGameState(prev => {
+      if (!prev.activeDialogue.npc || !prev.activeDialogue.active) return prev;
+      
+      const nextIndex = prev.activeDialogue.currentResponseIndex + 1;
+      const npcDialogue = prev.activeDialogue.npc.dialogue;
+      
+      // If there are more dialogue lines
+      if (nextIndex < npcDialogue.length) {
+        // Speak the next dialogue line
+        speakText(npcDialogue[nextIndex]);
+        
+        return {
+          ...prev,
+          activeDialogue: {
+            ...prev.activeDialogue,
+            currentResponseIndex: nextIndex
+          }
+        };
+      } else {
+        // End the dialogue if there are no more lines
+        return {
+          ...prev,
+          activeDialogue: {
+            npc: null,
+            active: false,
+            currentResponseIndex: 0
+          }
+        };
+      }
+    });
+  }, [speakText]);
+
+  // Function to end dialogue
+  const endDialogue = useCallback(() => {
+    setGameState(prev => ({
+      ...prev,
+      activeDialogue: {
+        npc: null,
+        active: false,
+        currentResponseIndex: 0
+      }
+    }));
+    
+    // Check for quest progress
+    checkForQuestProgress();
+  }, [checkForQuestProgress]);
+
+  // Toggle inventory panel
+  const toggleInventory = useCallback(() => {
+    setGameState(prev => ({
+      ...prev,
+      uiState: {
+        ...prev.uiState,
+        inventoryOpen: !prev.uiState.inventoryOpen,
+        questLogOpen: false // Close quest log if it's open
+      }
+    }));
+  }, []);
+
+  // Toggle quest log panel
+  const toggleQuestLog = useCallback(() => {
+    setGameState(prev => ({
+      ...prev,
+      uiState: {
+        ...prev.uiState,
+        questLogOpen: !prev.uiState.questLogOpen,
+        inventoryOpen: false // Close inventory if it's open
+      }
+    }));
+  }, []);
+
+  // Toggle tutorial visibility
+  const toggleTutorial = useCallback(() => {
+    setGameState(prev => ({
+      ...prev,
+      uiState: {
+        ...prev.uiState,
+        showTutorial: !prev.uiState.showTutorial
+      }
+    }));
+  }, []);
+
+  // Accept a quest
+  const acceptQuest = useCallback((questId: string) => {
+    setGameState(prev => {
+      const npc = prev.npcs.find(n => n.quest?.id === questId);
+      if (!npc || !npc.quest) return prev;
+      
+      // Add the quest to active quests if it's not already there
+      if (!prev.activeQuests.some(q => q.id === questId)) {
+        return {
+          ...prev,
+          activeQuests: [...prev.activeQuests, npc.quest]
+        };
+      }
+      
+      return prev;
+    });
+  }, []);
+
+  // Send player message to AI for response
+  const sendPlayerMessage = useCallback(async (message: string) => {
+    // Get current NPC
+    const npc = gameState.activeDialogue.npc;
+    if (!npc) return;
+    
+    // Update conversation history with player's message
+    setGameState(prev => ({
+      ...prev,
+      currentConversationHistory: [...prev.currentConversationHistory, `Player: ${message}`]
+    }));
+    
+    // Show loading/typing indicator in the dialogue UI
+    setGameState(prev => {
+      const updatedNpc = { ...prev.activeDialogue.npc! };
+      return {
+        ...prev,
+        activeDialogue: {
+          ...prev.activeDialogue,
+          npc: {
+            ...updatedNpc,
+            dialogue: [...updatedNpc.dialogue, "...typing..."]
+          },
+          currentResponseIndex: updatedNpc.dialogue.length
+        }
+      };
+    });
+    
+    try {
+      // Prepare prompt with context
+      const conversationContext = gameState.currentConversationHistory.join("\n");
+      
+      // Enhanced prompt to allow for more open-ended conversation
+      const prompt = `
+You are ${npc.name} in the game "Mystic Realms", a fantasy RPG. 
+${npc.personality || "You are a friendly and helpful NPC."}
+
+Game context:
+- You are part of a fantasy world with quests, items, and adventures
+- You can discuss any topic the player brings up, but should gently guide them back to their quest objectives if they seem off-track for too long
+- You have knowledge about the game world and can provide hints and guidance
+- You should stay in character at all times
+
+Previous conversation:
+${conversationContext}
+
+The player just said: "${message}"
+
+Respond as ${npc.name} would in character, in a brief, conversational way (max 2-3 sentences). If the player has been chatting about off-topic subjects for a while, subtly remind them of their quest or objectives, but don't force it.
+      `;
+      
+      // Define response schema for structured output
+      const responseSchema = { 
+        type: "object", 
+        properties: { 
+          response: { 
+            type: "string", 
+            description: "The NPC's response text" 
+          },
+          isRedirectingToQuest: {
+            type: "boolean",
+            description: "Whether this response is attempting to redirect the player to their quest objectives"
+          }
+        }, 
+        required: ["response"] 
+      };
+      
+      // Prepare payload for Gemini API
+      const payload = { 
+        contents: [{ 
+          parts: [{ text: prompt }] 
+        }], 
+        generationConfig: { 
+          response_mime_type: 'application/json', 
+          response_schema: responseSchema 
+        } 
+      };
+      
+      // Call Gemini API
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        }
+      );
+      
+      if (!response.ok) {
+        throw new Error(`API error: ${response.status}`);
+      }
+      
+      const data = await response.json();
+      let aiResponse = "I'm not sure how to respond to that.";
+      let isRedirectingToQuest = false;
+      
+      try {
+        // Extract the AI response from the JSON structure
+        if (data.candidates && 
+            data.candidates[0]?.content?.parts && 
+            data.candidates[0].content.parts[0]?.functionResponse?.response) {
+          aiResponse = data.candidates[0].content.parts[0].functionResponse.response;
+          isRedirectingToQuest = data.candidates[0].content.parts[0].functionResponse.isRedirectingToQuest || false;
+        } else if (data.candidates && 
+                  data.candidates[0]?.content?.parts && 
+                  data.candidates[0].content.parts[0]?.text) {
+          // Parse the text if it's in JSON format
+          const textContent = data.candidates[0].content.parts[0].text;
+          try {
+            const jsonResponse = JSON.parse(textContent);
+            if (jsonResponse.response) {
+              aiResponse = jsonResponse.response;
+              isRedirectingToQuest = jsonResponse.isRedirectingToQuest || false;
+            }
+          } catch (e) {
+            // If not valid JSON, use the text directly if it's not too long
+            if (textContent.length < 200) {
+              aiResponse = textContent;
+            }
+          }
+        }
+      } catch (e) {
+        console.error("Error parsing AI response:", e);
+      }
+      
+      // Speak the AI response
+      speakText(aiResponse);
+      
+      // Update the dialogue in the UI
+      setGameState(prev => {
+        // First, update the NPC's dialogue array in both the activeDialogue and npcs state
+        const updatedNpcs = prev.npcs.map(n => {
+          if (n.id === npc.id) {
+            // Create a copy of the NPC's dialogue
+            const updatedDialogue = [...n.dialogue];
+            // Replace the typing indicator with the real response
+            if (updatedDialogue[updatedDialogue.length - 1] === "...typing...") {
+              updatedDialogue[updatedDialogue.length - 1] = aiResponse;
+            } else {
+              // If there's no typing indicator (shouldn't happen), add the response
+              updatedDialogue.push(aiResponse);
+            }
+            return {
+              ...n,
+              dialogue: updatedDialogue
+            };
+          }
+          return n;
+        });
+        
+        // Get the updated NPC with new dialogue
+        const updatedActiveNpc = updatedNpcs.find(n => n.id === npc.id);
+        
+        return {
+          ...prev,
+          npcs: updatedNpcs,
+          activeDialogue: {
+            ...prev.activeDialogue,
+            npc: updatedActiveNpc,
+            currentResponseIndex: updatedActiveNpc?.dialogue.length ? updatedActiveNpc.dialogue.length - 1 : 0
+          },
+          currentConversationHistory: [...prev.currentConversationHistory, `${npc.name}: ${aiResponse}`]
+        };
+      });
+      
+    } catch (error) {
+      console.error("Error getting AI response:", error);
+      
+      // Update with a fallback response
+      const fallbackResponse = "I'm sorry, I'm having trouble understanding. Perhaps we can talk about something else?";
+      speakText(fallbackResponse);
+      
+      // Update the dialogue in the UI with the fallback response
+      setGameState(prev => {
+        // Update the NPC's dialogue array in both the activeDialogue and npcs state
+        const updatedNpcs = prev.npcs.map(n => {
+          if (n.id === npc.id) {
+            // Create a copy of the NPC's dialogue
+            const updatedDialogue = [...n.dialogue];
+            // Replace the typing indicator with the fallback response
+            if (updatedDialogue[updatedDialogue.length - 1] === "...typing...") {
+              updatedDialogue[updatedDialogue.length - 1] = fallbackResponse;
+            } else {
+              // If there's no typing indicator, add the fallback response
+              updatedDialogue.push(fallbackResponse);
+            }
+            return {
+              ...n,
+              dialogue: updatedDialogue
+            };
+          }
+          return n;
+        });
+        
+        // Get the updated NPC with new dialogue
+        const updatedActiveNpc = updatedNpcs.find(n => n.id === npc.id);
+        
+        return {
+          ...prev,
+          npcs: updatedNpcs,
+          activeDialogue: {
+            ...prev.activeDialogue,
+            npc: updatedActiveNpc,
+            currentResponseIndex: updatedActiveNpc?.dialogue.length ? updatedActiveNpc.dialogue.length - 1 : 0
+          },
+          currentConversationHistory: [...prev.currentConversationHistory, `${npc.name}: ${fallbackResponse}`]
+        };
+      });
+    }
+  }, [gameState.activeDialogue.npc, gameState.npcs, gameState.currentConversationHistory, speakText]);
+
+  // Add this function to handle direct item interaction (when pressing E near an item)
+  const interactWithItem = useCallback(() => {
+    setGameState(prev => {
+      const { player, questItems, inventory, activeQuests } = prev;
+      
+      // Find nearest quest item within interaction range
+      const nearbyItem = questItems.find(item => 
+        isInProximity(player.position, item.position, 1) // 1 tile radius
+      );
+      
+      if (!nearbyItem) return prev; // No nearby items
+      
+      // Check if this item is needed for any active quest
+      const relevantQuest = activeQuests.find(quest => 
+        quest.relatedQuestItemIds.includes(nearbyItem.id)
+      );
+      
+      if (!relevantQuest) {
+        // Generic item collection if not part of a quest
+        toast({
+          title: "Item Found",
+          description: `You found: ${nearbyItem.name}`,
+          duration: 3000,
+        });
+        
+        // Add to inventory and remove from world
+        const inventoryItem: Item = {
+          ...nearbyItem,
+          position: undefined // Remove position from inventory items
+        };
+        
+        return {
+          ...prev,
+          inventory: [...inventory, inventoryItem],
+          questItems: questItems.filter(item => item.id !== nearbyItem.id)
+        };
+      }
+      
+      // Handle quest-specific item collection
+      let updatedQuests = [...activeQuests];
+      let questUpdated = false;
+      
+      // Find the specific objective this item relates to
+      updatedQuests = updatedQuests.map(quest => {
+        if (quest.id !== relevantQuest.id) return quest;
+        
+        const updatedQuest = { ...quest };
+        
+        // Update the correct objective
+        updatedQuest.objectives = quest.objectives.map(objective => {
+          if (objective.completed) return objective;
+          
+          if (objective.type === 'collect') {
+            // Special case for firebloom petals (multiple items with same name)
+            if (quest.id === 'quest3' && objective.id === 'q3_obj1' && nearbyItem.name === 'Firebloom Petal') {
+              const newProgress = (objective.currentProgress || 0) + 1;
+              const isComplete = newProgress >= (objective.count || 1);
+              
+              questUpdated = true;
+              
+              // Show appropriate notification
+              if (isComplete) {
+                toast({
+                  title: "Quest Update",
+                  description: `Objective completed: ${objective.description}`,
+                  duration: 3000,
+                });
+              } else {
+                toast({
+                  title: "Quest Update",
+                  description: `Progress: ${newProgress}/${objective.count}`,
+                  duration: 3000,
+                });
+              }
+              
+              return {
+                ...objective,
+                currentProgress: newProgress,
+                completed: isComplete
+              };
+            }
+            // Regular case - direct item ID matching
+            else if (objective.targetId === nearbyItem.id) {
+              const newProgress = (objective.currentProgress || 0) + 1;
+              const isComplete = newProgress >= (objective.count || 1);
+              
+              questUpdated = true;
+              
+              // Show appropriate notification
+              if (isComplete) {
+                toast({
+                  title: "Quest Update",
+                  description: `Objective completed: ${objective.description}`,
+                  duration: 3000,
+                });
+              } else {
+                toast({
+                  title: "Quest Update",
+                  description: `Progress: ${newProgress}/${objective.count}`,
+                  duration: 3000,
+                });
+              }
+              
+              return {
+                ...objective,
+                currentProgress: newProgress,
+                completed: isComplete
+              };
+            }
+          }
+          
+          return objective;
+        });
+        
+        return updatedQuest;
+      });
+      
+      // Common notification for item collection
+      toast({
+        title: "Item Collected",
+        description: `You found: ${nearbyItem.name}`,
+        duration: 3000,
+      });
+      
+      // Add item to inventory and remove from world
+      const inventoryItem: Item = {
+        ...nearbyItem,
+        position: undefined // Remove position from inventory items
+      };
+      
+      return {
+        ...prev,
+        activeQuests: updatedQuests,
+        inventory: [...inventory, inventoryItem],
+        questItems: questItems.filter(item => item.id !== nearbyItem.id)
+      };
+    });
+  }, []);
+
+  // Process voice commands
+  const processVoiceCommand = useCallback((command: string) => {
+    const normalizedCommand = command.toLowerCase().trim();
+    
+    // If in dialogue, treat most commands as messages to the NPC 
+    // except for a few specific navigation commands
+    if (gameState.activeDialogue.active) {
+      // Still handle these specific commands even in dialogue mode
+      if (normalizedCommand.includes('close') || normalizedCommand.includes('exit') || 
+          normalizedCommand === 'end' || normalizedCommand === 'leave' || 
+          normalizedCommand === 'goodbye') {
+        endDialogue();
+      } else if (normalizedCommand.includes('continue') || normalizedCommand.includes('next')) {
+        continueDialogue();
+      } else {
+        // Treat all other voice input as chat with the NPC
+        sendPlayerMessage(command);
+        return; // Exit early to avoid processing other commands
+      }
+      return;
+    }
+    
+    // If not in dialogue, process normal game commands
+    
+    // Handle movement commands
+    if (normalizedCommand.includes('go up') || normalizedCommand.includes('move up') || normalizedCommand === 'up') {
+      // movePlayer('up'); // Removed - Movement handled by game loop
+    } else if (normalizedCommand.includes('go down') || normalizedCommand.includes('move down') || normalizedCommand === 'down') {
+      // movePlayer('down'); // Removed - Movement handled by game loop
+    } else if (normalizedCommand.includes('go left') || normalizedCommand.includes('move left') || normalizedCommand === 'left') {
+      // movePlayer('left'); // Removed - Movement handled by game loop
+    } else if (normalizedCommand.includes('go right') || normalizedCommand.includes('move right') || normalizedCommand === 'right') {
+      // movePlayer('right'); // Removed - Movement handled by game loop
+    }
+    // Handle interaction commands
+    else if (normalizedCommand.includes('talk') || normalizedCommand.includes('speak') || normalizedCommand.includes('interact')) {
+      // Find the nearest NPC
+      const nearbyNPC = gameState.npcs.find(npc => 
+        isInProximity(gameState.player.position, npc.position, 1)
+      );
+      
+      if (nearbyNPC) {
+        interactWithNPC(nearbyNPC.id);
+      } else {
+        toast({
+          title: "No one nearby",
+          description: "Move closer to someone to talk",
+          duration: 3000,
+        });
+      }
+    }
+    // Handle item collection commands
+    else if (normalizedCommand.includes('pick up') || normalizedCommand.includes('collect') || 
+             normalizedCommand.includes('grab') || normalizedCommand.includes('take')) {
+      // Try to pick up nearby items
+      interactWithItem();
+    }
+    // Handle quest commands
+    else if (normalizedCommand.includes('complete quest') || normalizedCommand.includes('finish quest') ||
+             normalizedCommand.includes('turn in') || normalizedCommand.includes('submit quest')) {
+      // Find the nearest NPC
+      const nearbyNPC = gameState.npcs.find(npc => 
+        isInProximity(gameState.player.position, npc.position, 1)
+      );
+      
+      if (nearbyNPC) {
+        // Check if this NPC is related to any completable quest
+        const completableQuest = gameState.activeQuests.find(quest => {
+          if (quest.npcId !== nearbyNPC.id) return false;
+          
+          // Check if all non-interaction objectives are complete
+          const allOtherObjectivesComplete = quest.objectives
+            .filter(obj => obj.type !== 'interact')
+            .every(obj => obj.completed);
+            
+          return allOtherObjectivesComplete;
+        });
+        
+        if (completableQuest) {
+          interactWithNPC(nearbyNPC.id);
+          toast({
+            title: "Completing quest",
+            description: `Turning in quest: ${completableQuest.title}`,
+            duration: 3000,
+          });
+        } else {
+          toast({
+            title: "Cannot complete quest",
+            description: "No completable quests for this NPC",
+            duration: 3000,
+          });
+        }
+      } else {
+        toast({
+          title: "No quest giver nearby",
+          description: "Move closer to a quest giver",
+          duration: 3000,
+        });
+      }
+    }
+    // Handle UI commands
+    else if (normalizedCommand.includes('inventory') || normalizedCommand.includes('items')) {
+      toggleInventory();
+    } else if (normalizedCommand.includes('quest') || normalizedCommand.includes('missions')) {
+      toggleQuestLog();
+    } else if (normalizedCommand.includes('close') || normalizedCommand.includes('exit')) {
+      // Close any open UI panels
+      if (gameState.uiState.inventoryOpen || gameState.uiState.questLogOpen) {
+        setGameState(prev => ({
+          ...prev,
+          uiState: {
+            ...prev.uiState,
+            inventoryOpen: false,
+            questLogOpen: false,
+            showLevelUp: prev.uiState.showLevelUp // Preserve this value
+          }
+        }));
+      }
+    } else if (normalizedCommand === 'tutorial') {
+      toggleTutorial();
+    }
+  }, [gameState.npcs, gameState.player.position, gameState.activeDialogue.active, 
+     gameState.uiState.inventoryOpen, gameState.uiState.questLogOpen, gameState.activeQuests,
+     // movePlayer, // Removed
+     interactWithNPC, interactWithItem, toggleInventory, toggleQuestLog, 
+     continueDialogue, endDialogue, sendPlayerMessage, toggleTutorial]);
+
+  // Voice recognition setup
+  const startVoiceRecognition = useCallback(() => {
+    if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
+      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+      const recognition = new SpeechRecognition();
+      
+      recognition.continuous = false;
+      recognition.interimResults = false;
+      recognition.lang = 'en-US';
+      
+      recognition.onstart = () => {
+        setIsListening(true);
+        toast({
+          title: "Listening...",
+          description: "Say a command",
+          duration: 3000,
+        });
+      };
+      
+      recognition.onresult = (event) => {
+        const command = event.results[0][0].transcript;
+        toast({
+          title: "Command received",
+          description: command,
+          duration: 2000,
+        });
+        processVoiceCommand(command);
+      };
+      
+      recognition.onerror = (event) => {
+        console.error('Speech recognition error', event.error);
+        setIsListening(false);
+        toast({
+          title: "Voice recognition error",
+          description: event.error,
+          variant: "destructive",
+          duration: 3000,
+        });
+      };
+      
+      recognition.onend = () => {
+        setIsListening(false);
+      };
+      
+      recognition.start();
+      
+      // Store the recognition instance to stop it later
+      window.currentRecognition = recognition;
+    } else {
+      toast({
+        title: "Voice recognition not supported",
+        description: "Your browser doesn't support the Web Speech API",
+        variant: "destructive",
+        duration: 3000,
+      });
+    }
+  }, [processVoiceCommand]);
+
+  // Stop voice recognition
+  const stopVoiceRecognition = useCallback(() => {
+    if (window.currentRecognition) {
+      window.currentRecognition.stop();
+      setIsListening(false);
+    }
+  }, []);
+
+  // Define closeQuiz before it's used in handleKeyDown or submitQuizAnswer
+  const closeQuiz = useCallback(() => {
+    setGameState(prev => ({
+      ...prev,
+      activeQuiz: {
+        npcId: null,
+        active: false,
+        playerAnswer: '',
+        currentQuiz: null
+      }
+    }));
+  }, [setGameState]);
+
+  // Listen for keyboard input
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const key = e.key.toLowerCase();
+
+      // Handle non-movement keys first (only trigger once per press)
+      if (!['w', 'a', 's', 'd', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright'].includes(key)) {
+        // Skip input if dialogue is active (except Escape/Space/Enter)
+        if (gameState.activeDialogue.active) {
+          if (key === 'escape') {
+            e.preventDefault();
+            endDialogue();
+          } else if (key === ' ' || key === 'enter') {
+            e.preventDefault();
+            continueDialogue();
+          }
+          return;
+        }
+
+        // Skip input if quiz is active (except Escape)
+        if (gameState.activeQuiz.active) {
+          if (key === 'escape') {
+            e.preventDefault();
+            closeQuiz();
+            toast({
+              title: "Quiz Cancelled",
+              description: "You can try again later.",
+              duration: 3000,
+            });
+          }
+          return;
+        }
+
+        // Close tutorial if it's open with ESC
+        if (gameState.uiState.showTutorial) {
+          if (key === 'escape') {
+            e.preventDefault();
+            toggleTutorial();
+            return;
+          }
+          // Skip other input if tutorial is open
+          return;
+        }
+
+        // Skip input if any UI window is open (except Escape)
+        if (gameState.uiState.inventoryOpen || gameState.uiState.questLogOpen) {
+          if (key === 'escape') {
+            e.preventDefault();
+            if (gameState.uiState.inventoryOpen) toggleInventory();
+            else if (gameState.uiState.questLogOpen) toggleQuestLog();
+          }
+          return;
+        }
+
+        // Handle single-press actions
+        switch (key) {
+          case 'e': // Interaction key
+            e.preventDefault();
+            const nearbyNpc = gameState.npcs.find(npc =>
+              isInProximity(gameState.player.position, npc.position)
+            );
+            if (nearbyNpc) interactWithNPC(nearbyNpc.id);
+            else interactWithItem();
+            break;
+          case 'i': // Inventory
+            e.preventDefault();
+            toggleInventory();
+            break;
+          case 'q': // Quest log
+            e.preventDefault();
+            toggleQuestLog();
+            break;
+          case 'h': // Help/Tutorial
+            e.preventDefault();
+            toggleTutorial();
+            break;
+          case 'v': // Voice command activation
+            e.preventDefault();
+            startVoiceRecognition();
+            break;
+          case 'escape': // General escape (closes UI if open, handled above)
+             e.preventDefault();
+            // If no UI is open, Escape doesn't do anything here currently
+            break;
+        }
+      } else {
+        // Handle movement keys (add to set)
+        // Prevent default browser scrolling for arrow keys
+        if (key.startsWith('arrow')) {
+            e.preventDefault();
+        }
+        // Add key to the set if not already present
+         if (!heldKeys.has(key)) {
+           setHeldKeys(prev => new Set(prev).add(key));
+         }
+      }
+    };
+
+    const handleKeyUp = (e: KeyboardEvent) => {
+       const key = e.key.toLowerCase();
+       // Remove movement keys from the set on keyup
+       if (['w', 'a', 's', 'd', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright'].includes(key)) {
+           setHeldKeys(prev => {
+             const newKeys = new Set(prev);
+             newKeys.delete(key);
+             return newKeys;
+           });
+       }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
+
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keyup', handleKeyUp);
+    };
+  }, [
+    // Remove movePlayer
+    gameState.player.position,
+    gameState.npcs,
+    gameState.activeDialogue.active,
+    gameState.uiState.inventoryOpen,
+    gameState.uiState.questLogOpen,
+    gameState.activeQuiz.active,
+    interactWithNPC,
+    interactWithItem,
+    toggleInventory,
+    toggleQuestLog,
+    continueDialogue,
+    endDialogue,
+    stopVoiceRecognition,
+    isInProximity,
+    toast,
+    closeQuiz,
+    startVoiceRecognition,
+    heldKeys // Add heldKeys as dependency
+  ]);
+
+  // Initialize speech synthesis voices when available
+  useEffect(() => {
+    if ('speechSynthesis' in window) {
+      // Load voices - this is needed especially for Chrome
+      const populateVoiceList = () => {
+        window.speechSynthesis.getVoices();
+      };
+      
+      populateVoiceList();
+      
+      if (window.speechSynthesis.onvoiceschanged !== undefined) {
+        window.speechSynthesis.onvoiceschanged = populateVoiceList;
+      }
+    }
+  }, []);
+
+  // Effect to handle interaction trigger after quiz completion
+  useEffect(() => {
+    if (gameState.npcToInteractAfterQuiz) {
+      const npcId = gameState.npcToInteractAfterQuiz;
+      
+      // Trigger interaction
+      interactWithNPC(npcId); 
+      
+      // Reset the trigger state
+      setGameState(prev => ({
+        ...prev,
+        npcToInteractAfterQuiz: null 
+      }));
+    }
+  // Depend on the trigger state and the interaction function itself
+  }, [gameState.npcToInteractAfterQuiz, interactWithNPC, setGameState]);
+
+  // Check for quest progress whenever player position changes
+  useEffect(() => {
+    checkForQuestProgress();
+  }, [gameState.player.position, gameState.activeDialogue.active, checkForQuestProgress]);
+
+  // Add a new function to handle quiz submission
+  const submitQuizAnswer = useCallback((answer: string) => {
+    // Get the active quiz NPC ID and quiz data from the state
+    const { npcId, currentQuiz } = gameState.activeQuiz;
+    if (!npcId || !currentQuiz) return; // Exit if no quiz is active
+    
+    // Find the corresponding NPC object
+    const targetNpc = gameState.npcs.find(n => n.id === npcId);
+    if (!targetNpc) return; // Exit if NPC not found
+    
+    // Check if the submitted answer is correct against the current quiz's expected output
+    if (answer.trim() === currentQuiz.expectedOutput.trim()) {
+      // Answer is correct: update state
+      setGameState(prev => ({
+        ...prev,
+        // Update the specific NPC to mark the quiz as passed
+        npcs: prev.npcs.map(n => 
+          n.id === npcId 
+            ? { ...n, hasPassedQuiz: true } 
+            : n
+        ),
+        // Deactivate the quiz UI
+        activeQuiz: {
+          npcId: null,
+          active: false,
+          playerAnswer: '',
+          currentQuiz: null
+        },
+        // Set the flag to trigger interaction after this state update
+        npcToInteractAfterQuiz: npcId 
+      }));
+      
+      // Show success message
+      toast({
+        title: "Correct!",
+        description: `You may now speak with ${targetNpc.name}.`,
+        duration: 3000,
+      });
+
+    } else {
+      // Answer is incorrect: show feedback
+      toast({
+        title: "Incorrect",
+        description: "Try again or press ESC to cancel.",
+        duration: 3000,
+      });
+    }
+  // Dependencies for the useCallback hook
+  }, [gameState.activeQuiz, gameState.npcs, setGameState, toast]);
+
+  // Function to reveal quest items when a quest is activated
+  const revealQuestItems = (questId: string, relatedItemIds: string[]) => {
+    setGameState(prev => {
+      // Find the hidden items related to this quest
+      const itemsToReveal = prev.hiddenQuestItems.filter(item => 
+        relatedItemIds.includes(item.id)
+      ).map(item => {
+        // Check if the item's position is walkable and accessible
+        const { x, y } = item.position;
+        
+        // Verify position is within map bounds and walkable
+        const isPositionWalkable = 
+          x >= 0 && 
+          y >= 0 && 
+          x < prev.gameMap[0]?.length && 
+          y < prev.gameMap.length && 
+          prev.gameMap[y][x].walkable;
+        
+        // Also check if a path exists from player to item
+        const isAccessible = isPositionWalkable && 
+                             findPath(prev.gameMap, prev.player.position, { x, y }) !== null;
+        
+        if (!isAccessible) {
+          // Find a new valid position for the item that's accessible
+          let newPosition: Position = { x: 0, y: 0 }; // Initialize with default
+          const width = prev.gameMap[0]?.length || 50;
+          const height = prev.gameMap.length || 50;
+          
+          // Try to find a valid position with multiple attempts
+          let attempts = 0;
+          const maxAttempts = 30;
+          let foundValidPosition = false;
+          
+          while (attempts < maxAttempts && !foundValidPosition) {
+            // Generate random coordinates (avoid edges)
+            const newX = Math.floor(Math.random() * (width - 4)) + 2;
+            const newY = Math.floor(Math.random() * (height - 4)) + 2;
+            
+            // Check if the position is valid (in bounds, walkable, and accessible)
+            if (newX >= 0 && 
+                newY >= 0 && 
+                newX < width && 
+                newY < height && 
+                prev.gameMap[newY][newX].walkable && 
+                findPath(prev.gameMap, prev.player.position, { x: newX, y: newY }) !== null) {
+              newPosition = { x: newX, y: newY };
+              foundValidPosition = true;
+              break;
+            }
+            
+            attempts++;
+          }
+          
+          // If we couldn't find a valid position, try adjacent to the player
+          if (!foundValidPosition) {
+            // Try positions near the player
+            const adjacentPositions = [
+              { x: prev.player.position.x + 1, y: prev.player.position.y },
+              { x: prev.player.position.x - 1, y: prev.player.position.y },
+              { x: prev.player.position.x, y: prev.player.position.y + 1 },
+              { x: prev.player.position.x, y: prev.player.position.y - 1 }
+            ];
+            
+            for (const pos of adjacentPositions) {
+              if (pos.x >= 0 && 
+                  pos.y >= 0 && 
+                  pos.x < width && 
+                  pos.y < height && 
+                  prev.gameMap[pos.y][pos.x].walkable) {
+                newPosition = pos;
+                foundValidPosition = true;
+                break;
+              }
+            }
+          }
+          
+          // Last resort fallback - use the player position + offset
+          if (!foundValidPosition) {
+            newPosition = { 
+              x: Math.min(width - 2, Math.max(1, prev.player.position.x + 1)),
+              y: Math.min(height - 2, Math.max(1, prev.player.position.y + 1))
+            };
+          }
+          
+          console.log(`Repositioning quest item ${item.id} from (${item.position.x},${item.position.y}) to (${newPosition.x},${newPosition.y}) - Ensuring accessibility`);
+          
+          // Return a new item with the updated position
+          return {
+            ...item,
+            position: newPosition
+          };
+        }
+        
+        return item;
+      });
+      
+      if (itemsToReveal.length === 0) return prev; // No items to reveal
+      
+      // Move items from hidden to visible
+      return {
+        ...prev,
+        questItems: [...prev.questItems, ...itemsToReveal],
+        hiddenQuestItems: prev.hiddenQuestItems.filter(item => 
+          !relatedItemIds.includes(item.id)
+        )
+      };
+    });
+  };
+
+  return (
+    <GameContext.Provider value={{
+      gameState,
+      // movePlayer, // Removed: Replaced by game loop logic
+      interactWithNPC,
+      continueDialogue,
+      endDialogue,
+      toggleInventory,
+      toggleQuestLog,
+      toggleTutorial,
+      acceptQuest,
+      processVoiceCommand,
+      startVoiceRecognition,
+      stopVoiceRecognition,
+      isListening,
+      sendPlayerMessage,
+      checkForQuestProgress,
+      interactWithItem,
+      submitQuizAnswer,
+      closeQuiz
+    }}>
+      {children}
+    </GameContext.Provider>
+  );
+};
+
+export const useGame = () => {
+  const context = useContext(GameContext);
+  if (context === undefined) {
+    throw new Error('useGame must be used within a GameProvider');
+  }
+  return context;
+};
+
+// Utility function to create a direct path between two positions if needed
+const createPathBetweenPositions = (gameMap: Tile[][], startPos: Position, endPos: Position): void => {
+  // First try to find an existing path
+  const path = findPath(gameMap, startPos, endPos);
+  
+  // If there's already a path, no need to create one
+  if (path !== null) return;
+  
+  // If no path exists, create a simple direct path
+  // Get the direction to move
+  const dx = endPos.x > startPos.x ? 1 : (endPos.x < startPos.x ? -1 : 0);
+  const dy = endPos.y > startPos.y ? 1 : (endPos.y < startPos.y ? -1 : 0);
+  
+  let currentX = startPos.x;
+  let currentY = startPos.y;
+  
+  // First move horizontally
+  while (currentX !== endPos.x) {
+    currentX += dx;
+    if (currentX >= 0 && currentX < gameMap[0].length && 
+        currentY >= 0 && currentY < gameMap.length) {
+      gameMap[currentY][currentX] = { terrain: 'path', walkable: true };
+    }
+  }
+  
+  // Then move vertically
+  while (currentY !== endPos.y) {
+    currentY += dy;
+    if (currentX >= 0 && currentX < gameMap[0].length && 
+        currentY >= 0 && currentY < gameMap.length) {
+      gameMap[currentY][currentX] = { terrain: 'path', walkable: true };
+    }
+  }
+};

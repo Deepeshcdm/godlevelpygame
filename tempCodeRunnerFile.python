@@ -1,0 +1,116 @@
+import pygame
+import requests
+import json
+import re
+import random
+
+# Constants
+API_KEY = "AIzaSyAo_edLyN42xYWoshKJFR8WH06nj_pXLAE"  # Replace this with your actual Gemini API key
+API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro-002:generateContent"
+WIDTH, HEIGHT = 800, 600
+FONT_SIZE = 24
+FPS = 60
+
+# Initialize Pygame
+pygame.init()
+screen = pygame.display.set_mode((WIDTH, HEIGHT))
+pygame.display.set_caption("Data Structures Learning Game")
+font = pygame.font.Font(None, FONT_SIZE)
+
+# Load background image and character images
+background_image = pygame.image.load("background.jpg")  # Ensure you have a background image
+happy_character_image = pygame.image.load("happy_character.png")  # Character image for correct answer
+sad_character_image = pygame.image.load("sad_character.png")  # Character image for incorrect answer
+
+class AIChatBot:
+    def _init_(self):
+        self.definition = ""
+        self.example = ""
+        self.quiz_question = ""
+        self.correct_answer = ""
+
+    def generate_content(self, data_structure):
+        self.definition = ""
+        self.example = ""
+        self.quiz_question = ""
+        self.correct_answer = ""
+
+        prompt = f"""
+        Provide a JSON object with:
+        - "definition": A short definition of {data_structure}
+        - "example": A basic Python code example
+        - "quiz": An object with a "question" and its "answer"
+
+        Respond with only the raw JSON. No explanation or formatting.
+        """
+
+        headers = {"Content-Type": "application/json"}
+        payload = {
+            "contents": [
+                {
+                    "parts": [{"text": prompt.strip()}]
+                }
+            ]
+        }
+
+        try:
+            response = requests.post(f"{API_URL}?key={API_KEY}", headers=headers, json=payload, timeout=10)
+            response.raise_for_status()
+            content = response.json()
+            raw_text = content["candidates"][0]["content"]["parts"][0]["text"]
+
+            # Extract JSON using regex
+            match = re.search(r"\{.*\}", raw_text, re.DOTALL)
+            if not match:
+                raise ValueError("No JSON object found in response.")
+
+            json_string = match.group(0)
+            parsed = json.loads(json_string)
+
+            self.definition = parsed.get("definition", "")
+            self.example = parsed.get("example", "")
+            quiz = parsed.get("quiz", {})
+            self.quiz_question = quiz.get("question", "")
+            self.correct_answer = quiz.get("answer", "")
+
+        except Exception as e:
+            print(f"Error: {e}")
+
+class Character:
+    def _init_(self):
+        self.level = 1
+        self.experience = 0
+
+    def upgrade(self):
+        self.experience += 1
+        if self.experience >= 3:  # Upgrade every 3 correct answers
+            self.level += 1
+            self.experience = 0  # Reset experience after leveling up
+
+    def get_status(self):
+        return f"Level: {self.level}, Experience: {self.experience}"
+
+def fade_in_text(text, position, duration=1000):
+    """Fade in text effect."""
+    for alpha in range(0, 255, 5):
+        text_surface = font.render(text, True, (0, 0, 0))
+        text_surface.set_alpha(alpha)
+        screen.blit(text_surface, position)
+        pygame.display.flip()
+        pygame.time.delay(duration // 51)  # 51 steps for fade in
+
+def display_celebration():
+    """Display celebration animation for correct answer."""
+    celebration_text = "Yay! Correct Answer!"
+    fade_in_text(celebration_text, (WIDTH // 2 - 100, HEIGHT // 2), duration=2000)
+
+def display_motivation():
+    """Display motivational message for incorrect answer."""
+    motivation_text = "Try Again!"
+    fade_in_text(motivation_text, (WIDTH // 2 - 50, HEIGHT // 2), duration=2000)
+
+def main():
+    clock = pygame.time.Clock()
+    chatbot = AIChatBot()
+    character = Character()
+    running = True
